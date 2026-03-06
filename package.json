@@ -1,0 +1,23 @@
+{
+  "name": "codex-desktop-control",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "check": "tsc --noEmit",
+    "bot:start": "mkdir -p .run && sh ./scripts/bot-start.sh",
+    "bot:stop": "sh ./scripts/bot-stop.sh",
+    "bot:status": "sh ./scripts/bot-status.sh"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.59.0",
+    "dotenv": "^17.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  }
+}
