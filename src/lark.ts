@@ -10,6 +10,103 @@ import { includeContentInLogs, logger, rawLogString } from "./logger.js";
 
 const shouldLogContent = includeContentInLogs();
 
+type LarkCardElement =
+  | {
+      tag: "markdown";
+      content: string;
+      text_align?: "left" | "center" | "right";
+      text_size?: "normal" | "heading" | "notation";
+    }
+  | {
+      tag: "hr";
+    };
+
+function splitMarkdownBlocks(text: string): string[] {
+  const normalized = text.replace(/\r\n?/g, "\n").trim();
+  if (!normalized) {
+    return [];
+  }
+
+  const lines = normalized.split("\n");
+  const blocks: string[] = [];
+  let current: string[] = [];
+  let inCodeFence = false;
+
+  const flush = () => {
+    if (current.length === 0) return;
+    const block = current.join("\n").trim();
+    if (block) {
+      blocks.push(block);
+    }
+    current = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      if (!inCodeFence && current.length > 0) {
+        flush();
+      }
+      current.push(line);
+      inCodeFence = !inCodeFence;
+      if (!inCodeFence) {
+        flush();
+      }
+      continue;
+    }
+
+    if (inCodeFence) {
+      current.push(line);
+      continue;
+    }
+
+    if (!trimmed) {
+      flush();
+      continue;
+    }
+
+    const isBullet = /^([-*+]|\d+\.)\s+/.test(trimmed);
+    const previousIsBullet =
+      current.length > 0 && /^([-*+]|\d+\.)\s+/.test(current[current.length - 1]!.trim());
+
+    if (isBullet && current.length > 0 && !previousIsBullet) {
+      flush();
+    }
+
+    current.push(line);
+  }
+
+  flush();
+  return blocks;
+}
+
+function buildCardElements(text: string): LarkCardElement[] {
+  const blocks = splitMarkdownBlocks(text);
+  if (blocks.length === 0) {
+    return [
+      {
+        tag: "markdown",
+        content: text,
+      },
+    ];
+  }
+
+  return blocks.flatMap((block, index) => {
+    const elements: LarkCardElement[] = [
+      {
+        tag: "markdown",
+        content: block,
+      },
+    ];
+
+    if (index < blocks.length - 1) {
+      elements.push({ tag: "hr" });
+    }
+
+    return elements;
+  });
+}
+
 function toInteractiveCardContent(text: string): string {
   return JSON.stringify({
     config: {
@@ -23,15 +120,7 @@ function toInteractiveCardContent(text: string): string {
       },
       template: "blue",
     },
-    elements: [
-      {
-        tag: "div",
-        text: {
-          tag: "lark_md",
-          content: text,
-        },
-      },
-    ],
+    elements: buildCardElements(text),
   });
 }
 
