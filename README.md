@@ -55,7 +55,8 @@ npm run bot:stop --prefix /Users/erhu/code/python/CodexDesktopControl
 - `CODEX_BIN`：默认为 `codex`
 - `CODEX_MODEL`：可选，用于覆盖 `codex exec` 的模型参数
 - `CODEX_SANDBOX`：可选，默认是 `read-only`。只允许 `read-only`、`workspace-write`、`danger-full-access` 这 3 个值，会原样传给 `codex exec -s`。
-- `CODEX_SYSTEM_PROMPT`：每次转发飞书消息前追加的系统提示词
+- `CODEX_SYSTEM_PROMPT`：可选。额外追加到内置提示词后的系统提示词
+- `CODEX_PROMPT_DIR`：可选。覆盖默认模板目录；默认读取 `src/agents/md_files/zh`
 - `CODEX_WORKDIR`：传给 `codex exec` 的工作目录
 
 ## 说明
@@ -65,3 +66,6 @@ npm run bot:stop --prefix /Users/erhu/code/python/CodexDesktopControl
 - 非文本消息目前会返回兜底提示
 - 长连接模式不需要公网回调地址
 - 这台机器本地需要先能正常使用 `codex`
+- 首次启动时会把默认的 `AGENTS.md`、`PROFILE.md`、`MEMORY.md`、`SOUL.md`、`BOOTSTRAP.md`、`HEARTBEAT.md` 初始化到 `CODEX_WORKDIR`
+- 运行时会优先读取 `CODEX_WORKDIR` 里的 `AGENTS.md`、`PROFILE.md`、`MEMORY.md`、`SOUL.md` 来构建 system prompt
+- 只要 `CODEX_WORKDIR/BOOTSTRAP.md` 还存在，机器人就会保持首次引导模式；引导完成并删除该文件后，恢复普通协作模式

@@ -3,6 +3,8 @@ import "dotenv/config";
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { spawn } from "node:child_process";
 
+import { buildSystemPrompt } from "./prompt.js";
+
 type ChatRole = "user" | "assistant";
 
 type ChatTurn = {
@@ -51,9 +53,8 @@ const codexBin = process.env.CODEX_BIN || "codex";
 const codexSandboxRaw = process.env.CODEX_SANDBOX || "read-only";
 const codexModel = process.env.CODEX_MODEL;
 const codexWorkdir = process.env.CODEX_WORKDIR || process.cwd();
-const systemPrompt =
-  process.env.CODEX_SYSTEM_PROMPT ||
-  "你是在飞书里回复的 Codex。默认简洁回答。";
+const codexPromptTemplateDir = process.env.CODEX_PROMPT_DIR;
+const extraSystemPrompt = process.env.CODEX_SYSTEM_PROMPT;
 
 if (!sandboxModes.includes(codexSandboxRaw as SandboxMode)) {
   throw new Error(
@@ -62,6 +63,15 @@ if (!sandboxModes.includes(codexSandboxRaw as SandboxMode)) {
 }
 
 const codexSandbox = codexSandboxRaw as SandboxMode;
+
+function getSystemPrompt(): string {
+  return buildSystemPrompt({
+    workdir: codexWorkdir,
+    sandbox: codexSandbox,
+    extraPrompt: extraSystemPrompt,
+    templateDir: codexPromptTemplateDir,
+  });
+}
 
 const larkClient = new Lark.Client({
   appId,
@@ -113,6 +123,7 @@ function shouldReplyInGroup(
 
 async function generateReply(chatId: string, userText: string): Promise<string> {
   const history = historyByChat.get(chatId) || [];
+  const systemPrompt = getSystemPrompt();
   const transcript = [...history, { role: "user" as const, content: userText }]
     .map((turn) => `${turn.role.toUpperCase()}: ${turn.content}`)
     .join("\n\n");
