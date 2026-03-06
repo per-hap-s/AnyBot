@@ -35,6 +35,7 @@ const appId = process.env.FEISHU_APP_ID as string;
 const appSecret = process.env.FEISHU_APP_SECRET as string;
 const groupChatMode = process.env.FEISHU_GROUP_CHAT_MODE || "mention";
 const botOpenId = process.env.FEISHU_BOT_OPEN_ID;
+const ackReaction = process.env.FEISHU_ACK_REACTION || "OK";
 const codexBin = process.env.CODEX_BIN || "codex";
 const codexSandbox = process.env.CODEX_SANDBOX || "read-only";
 const codexModel = process.env.CODEX_MODEL;
@@ -210,6 +211,51 @@ async function sendText(chatId: string, text: string): Promise<void> {
   });
 }
 
+async function sendAckReaction(messageId: string): Promise<void> {
+  if (!ackReaction) {
+    return;
+  }
+
+  await larkClient.im.messageReaction.create({
+    path: {
+      message_id: messageId,
+    },
+    data: {
+      reaction_type: {
+        emoji_type: ackReaction,
+      },
+    },
+  });
+}
+
+async function processMessage(message: {
+  message_id: string;
+  chat_id: string;
+  content: string;
+}): Promise<void> {
+  const rawText = parseIncomingText(message.content);
+  const userText = sanitizeUserText(rawText);
+
+  if (!userText) {
+    await sendText(message.chat_id, "请直接发送文字问题。");
+    return;
+  }
+
+  try {
+    await sendAckReaction(message.message_id);
+  } catch (error) {
+    console.error("Failed to send ack reaction", error);
+  }
+
+  try {
+    const reply = await generateReply(message.chat_id, userText);
+    await sendText(message.chat_id, reply);
+  } catch (error) {
+    console.error("Failed to handle message", error);
+    await sendText(message.chat_id, "处理消息时出错了，请稍后再试。");
+  }
+}
+
 async function handleMessage(event: {
   sender: {
     sender_type: string;
@@ -250,21 +296,7 @@ async function handleMessage(event: {
     }
   }
 
-  const rawText = parseIncomingText(message.content);
-  const userText = sanitizeUserText(rawText);
-
-  if (!userText) {
-    await sendText(message.chat_id, "请直接发送文字问题。");
-    return;
-  }
-
-  try {
-    const reply = await generateReply(message.chat_id, userText);
-    await sendText(message.chat_id, reply);
-  } catch (error) {
-    console.error("Failed to handle message", error);
-    await sendText(message.chat_id, "处理消息时出错了，请稍后再试。");
-  }
+  void processMessage(message);
 }
 
 const dispatcher = new Lark.EventDispatcher({}).register({

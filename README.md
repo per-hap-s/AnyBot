@@ -51,6 +51,7 @@ In the Feishu Open Platform app settings:
 
 - `FEISHU_GROUP_CHAT_MODE`: `mention` or `all`
 - `FEISHU_BOT_OPEN_ID`: optional, used to make mention-mode only respond when the bot itself is mentioned. Without it, any group message with mentions will trigger a reply.
+- `FEISHU_ACK_REACTION`: message reaction added immediately after receiving a user message, defaults to `OK`. Set to empty to disable.
 - `CODEX_BIN`: defaults to `codex`
 - `CODEX_MODEL`: optional model override for `codex exec`
 - `CODEX_SANDBOX`: defaults to `read-only`
@@ -60,6 +61,7 @@ In the Feishu Open Platform app settings:
 ## Notes
 
 - Conversation history is stored only in memory
+- The bot adds an immediate reaction to the user's message before generating the full reply
 - Non-text messages currently return a fallback text response
 - Long connection mode does not require a public callback URL
 - The bot relies on the local machine already being logged into `codex`
