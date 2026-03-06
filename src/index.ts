@@ -20,6 +20,12 @@ import {
   sendAckReaction,
   downloadImageFromMessage,
 } from "./lark.js";
+import {
+  includeContentInLogs,
+  includePromptInLogs,
+  logger,
+  rawLogString,
+} from "./logger.js";
 
 const requiredEnv = ["FEISHU_APP_ID", "FEISHU_APP_SECRET"] as const;
 
@@ -40,6 +46,8 @@ const codexModel = process.env.CODEX_MODEL;
 const codexWorkdir = process.env.CODEX_WORKDIR || process.cwd();
 const codexPromptTemplateDir = process.env.CODEX_PROMPT_DIR;
 const extraSystemPrompt = process.env.CODEX_SYSTEM_PROMPT;
+const shouldLogContent = includeContentInLogs();
+const shouldLogPrompt = includePromptInLogs();
 
 if (!sandboxModes.includes(codexSandboxRaw as SandboxMode)) {
   throw new Error(
@@ -163,6 +171,29 @@ ${transcript}
 Reply to the latest USER message only.
 When you create or reference an image that should be sent back to the user in Feishu, include the image file path in your final reply. Prefer an absolute path or Markdown image syntax like ![label](/absolute/path.png). Relative paths are resolved from the working directory.`;
 
+  logger.info("reply.generate.start", {
+    chatId,
+    historyTurns: history.length,
+    userTextChars: userText.length,
+    historyTextChars: historyText.length,
+    imageCount: imagePaths.length,
+    systemPromptChars: systemPrompt.length,
+    promptChars: prompt.length,
+    ...(shouldLogContent
+      ? {
+          userText: rawLogString(userText),
+          historyText: rawLogString(historyText),
+          transcript: rawLogString(transcript),
+        }
+      : {}),
+    ...(shouldLogPrompt
+      ? {
+          systemPrompt: rawLogString(systemPrompt),
+          prompt: rawLogString(prompt),
+        }
+      : {}),
+  });
+
   const outputText = await runCodex({
     bin: codexBin,
     workdir: codexWorkdir,
@@ -179,6 +210,17 @@ When you create or reference an image that should be sent back to the user in Fe
   ]);
   historyByChat.set(chatId, nextHistory);
 
+  logger.info("reply.generate.success", {
+    chatId,
+    replyChars: outputText.length,
+    nextHistoryTurns: nextHistory.length,
+    ...(shouldLogContent
+      ? {
+          replyText: rawLogString(outputText),
+        }
+      : {}),
+  });
+
   return outputText;
 }
 
@@ -192,7 +234,25 @@ async function processTextMessage(message: {
   const rawText = parseIncomingText(message.content);
   const userText = sanitizeUserText(rawText);
 
+  logger.info("message.text.received", {
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    rawTextChars: rawText.length,
+    userTextChars: userText.length,
+    ...(shouldLogContent
+      ? {
+          larkContent: rawLogString(message.content),
+          rawText: rawLogString(rawText),
+          userText: rawLogString(userText),
+        }
+      : {}),
+  });
+
   if (!userText) {
+    logger.warn("message.text.empty", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+    });
     await sendText(larkClient, message.chat_id, "请直接发送文字问题。");
     return;
   }
@@ -200,14 +260,22 @@ async function processTextMessage(message: {
   try {
     await sendAckReaction(larkClient, message.message_id, ackReaction);
   } catch (error) {
-    console.error("发送已收到 reaction 失败", error);
+    logger.warn("message.ack_failed", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+      error,
+    });
   }
 
   try {
     const reply = await generateReply(message.chat_id, userText);
     await sendReply(larkClient, message.chat_id, reply, codexWorkdir);
   } catch (error) {
-    console.error("处理消息失败", error);
+    logger.error("message.text.failed", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+      error,
+    });
     await sendText(larkClient, message.chat_id, formatCodexError(error));
   }
 }
@@ -218,10 +286,25 @@ async function processImageMessage(message: {
   message_type: string;
   content: string;
 }): Promise<void> {
+  logger.info("message.image.received", {
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    messageType: message.message_type,
+    ...(shouldLogContent
+      ? {
+          larkContent: rawLogString(message.content),
+        }
+      : {}),
+  });
+
   try {
     await sendAckReaction(larkClient, message.message_id, ackReaction);
   } catch (error) {
-    console.error("发送已收到 reaction 失败", error);
+    logger.warn("message.ack_failed", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+      error,
+    });
   }
 
   let imagePath: string | null = null;
@@ -238,7 +321,11 @@ async function processImageMessage(message: {
     );
     await sendReply(larkClient, message.chat_id, reply, codexWorkdir);
   } catch (error) {
-    console.error("处理图片消息失败", error);
+    logger.error("message.image.failed", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+      error,
+    });
     await sendText(
       larkClient,
       message.chat_id,
@@ -248,7 +335,12 @@ async function processImageMessage(message: {
     if (imagePath) {
       await rm(path.dirname(imagePath), { recursive: true, force: true }).catch(
         (cleanupError) => {
-          console.error("清理临时图片失败", cleanupError);
+          logger.warn("message.image.cleanup_failed", {
+            messageId: message.message_id,
+            chatId: message.chat_id,
+            imagePath,
+            error: cleanupError,
+          });
         },
       );
     }
@@ -270,18 +362,58 @@ async function handleMessage(event: {
 }): Promise<void> {
   const { sender, message } = event;
 
-  if (sender.sender_type === "app") return;
+  logger.info("message.received", {
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    chatType: message.chat_type,
+    messageType: message.message_type,
+    senderType: sender.sender_type,
+    mentionCount: message.mentions?.length || 0,
+    ...(shouldLogContent
+      ? {
+          larkContent: rawLogString(message.content),
+        }
+      : {}),
+  });
 
-  if (handledMessageIds.has(message.message_id)) return;
+  if (sender.sender_type === "app") {
+    logger.debug("message.skipped.app_sender", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+    });
+    return;
+  }
+
+  if (handledMessageIds.has(message.message_id)) {
+    logger.debug("message.skipped.duplicate", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+    });
+    return;
+  }
   handledMessageIds.add(message.message_id);
 
   if (message.message_type !== "text" && message.message_type !== "image") {
+    logger.warn("message.unsupported_type", {
+      messageId: message.message_id,
+      chatId: message.chat_id,
+      messageType: message.message_type,
+    });
     await sendText(larkClient, message.chat_id, "目前只支持文本和图片消息。");
     return;
   }
 
   if (message.chat_type === "group" || message.chat_type === "group_chat") {
-    if (!shouldReplyInGroup(message.mentions)) return;
+    if (!shouldReplyInGroup(message.mentions)) {
+      logger.debug("message.skipped.group_filter", {
+        messageId: message.message_id,
+        chatId: message.chat_id,
+        mentionCount: message.mentions?.length || 0,
+        groupChatMode,
+        botOpenId: botOpenId || null,
+      });
+      return;
+    }
   }
 
   if (message.message_type === "image") {
@@ -297,12 +429,23 @@ const dispatcher = new EventDispatcher({}).register({
 });
 
 async function main(): Promise<void> {
-  console.log("正在启动飞书机器人桥接服务...");
+  logger.info("service.starting", {
+    groupChatMode,
+    ackReaction,
+    codexBin,
+    codexSandbox,
+    codexModel: codexModel || null,
+    codexWorkdir,
+    promptTemplateDir: codexPromptTemplateDir || null,
+    extraSystemPrompt: extraSystemPrompt ? "<set>" : null,
+    logIncludeContent: shouldLogContent,
+    logIncludePrompt: shouldLogPrompt,
+  });
   await wsClient.start({ eventDispatcher: dispatcher });
-  console.log("飞书机器人桥接服务已启动。");
+  logger.info("service.started");
 }
 
 main().catch((error) => {
-  console.error("启动失败", error);
+  logger.error("service.start_failed", { error });
   process.exit(1);
 });

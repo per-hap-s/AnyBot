@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 
 import type { SandboxMode, CodexJsonEvent } from "./types.js";
+import { logger } from "./logger.js";
 
 export class CodexTimeoutError extends Error {
   constructor(timeoutMs: number) {
@@ -55,6 +56,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<string> {
     imagePaths = [],
     timeoutMs = DEFAULT_TIMEOUT_MS,
   } = opts;
+  const startedAt = Date.now();
 
   const args = [
     "exec",
@@ -75,6 +77,16 @@ export async function runCodex(opts: RunCodexOptions): Promise<string> {
   }
 
   args.push(prompt);
+
+  logger.info("codex.exec.start", {
+    bin,
+    workdir,
+    sandbox,
+    model: model || null,
+    imageCount: imagePaths.length,
+    promptChars: prompt.length,
+    timeoutMs,
+  });
 
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -105,6 +117,12 @@ export async function runCodex(opts: RunCodexOptions): Promise<string> {
 
     child.on("error", (error) => {
       clearTimeout(timer);
+      logger.error("codex.exec.spawn_error", {
+        workdir,
+        sandbox,
+        durationMs: Date.now() - startedAt,
+        error,
+      });
       reject(error);
     });
 
@@ -112,11 +130,28 @@ export async function runCodex(opts: RunCodexOptions): Promise<string> {
       clearTimeout(timer);
 
       if (killed) {
+        logger.warn("codex.exec.timeout", {
+          workdir,
+          sandbox,
+          durationMs: Date.now() - startedAt,
+          stdoutChars: stdout.length,
+          stderrChars: stderr.length,
+        });
         reject(new CodexTimeoutError(timeoutMs));
         return;
       }
 
       if (code !== 0) {
+        logger.error("codex.exec.non_zero_exit", {
+          code,
+          workdir,
+          sandbox,
+          durationMs: Date.now() - startedAt,
+          stdoutChars: stdout.length,
+          stderrChars: stderr.length,
+          stderrPreview: stderr.slice(0, 400),
+          stdoutPreview: stdout.slice(0, 400),
+        });
         reject(new CodexProcessError(code, stderr || stdout));
         return;
       }
@@ -146,10 +181,26 @@ export async function runCodex(opts: RunCodexOptions): Promise<string> {
 
       const lastMessage = messages.at(-1);
       if (!lastMessage) {
+        logger.error("codex.exec.parse_error", {
+          workdir,
+          sandbox,
+          durationMs: Date.now() - startedAt,
+          stdoutChars: stdout.length,
+          stdoutPreview: stdout.slice(0, 400),
+        });
         reject(new CodexParseError(stdout));
         return;
       }
 
+      logger.info("codex.exec.success", {
+        workdir,
+        sandbox,
+        durationMs: Date.now() - startedAt,
+        stdoutChars: stdout.length,
+        stderrChars: stderr.length,
+        messageCount: messages.length,
+        replyChars: lastMessage.length,
+      });
       resolve(lastMessage);
     });
   });

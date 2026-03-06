@@ -59,6 +59,9 @@ npm run bot:stop --prefix /Users/erhu/code/python/CodexDesktopControl
 - `CODEX_SYSTEM_PROMPT`：可选。额外追加到内置提示词后的系统提示词
 - `CODEX_PROMPT_DIR`：可选。覆盖默认模板目录；默认读取 `src/agents/md_files/zh`
 - `CODEX_WORKDIR`：传给 `codex exec` 的工作目录
+- `LOG_LEVEL`：可选。日志级别，支持 `debug`、`info`、`warn`、`error`，默认 `info`
+- `LOG_INCLUDE_CONTENT`：可选。设为 `true` 后，日志会包含飞书原始消息内容、清洗后的用户文本、实际回复文本
+- `LOG_INCLUDE_PROMPT`：可选。设为 `true` 后，日志会额外包含最终发给 `codex` 的完整 prompt
 
 ## 说明
 
@@ -72,3 +75,6 @@ npm run bot:stop --prefix /Users/erhu/code/python/CodexDesktopControl
 - 首次启动时会把默认的 `AGENTS.md`、`PROFILE.md`、`MEMORY.md`、`SOUL.md`、`BOOTSTRAP.md`、`HEARTBEAT.md` 初始化到 `CODEX_WORKDIR`
 - 运行时会优先读取 `CODEX_WORKDIR` 里的 `AGENTS.md`、`PROFILE.md`、`MEMORY.md`、`SOUL.md` 来构建 system prompt
 - 只要 `CODEX_WORKDIR/BOOTSTRAP.md` 还存在，机器人就会保持首次引导模式；引导完成并删除该文件后，恢复普通协作模式
+- 运行日志是单行 JSON，默认会记录消息接收、过滤、Codex 调用耗时、飞书回复与异常上下文；排查问题时可把 `LOG_LEVEL` 调到 `debug`
+- 如果你需要排查“飞书到底发来了什么、机器人最终回了什么、送给 codex 的 prompt 是什么”，可以同时开启 `LOG_INCLUDE_CONTENT=true` 和 `LOG_INCLUDE_PROMPT=true`
+- 应用日志默认写到 `.run/` 目录，文件名格式是 `bot.log.YYYYMMDD-HHMM`，按 10 分钟切分；`scripts/bot-start.sh` 的控制台输出单独写到 `.run/bot.runner.log`

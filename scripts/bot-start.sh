@@ -3,7 +3,7 @@ set -eu
 
 RUN_DIR=".run"
 PID_FILE="$RUN_DIR/bot.pid"
-LOG_FILE="$RUN_DIR/bot.log"
+RUNNER_LOG_FILE="$RUN_DIR/bot.runner.log"
 PROJECT_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 
 mkdir -p "$PROJECT_DIR/$RUN_DIR"
@@ -19,9 +19,9 @@ fi
 
 (
   cd "$PROJECT_DIR"
-  nohup npx tsx src/index.ts >>"$LOG_FILE" 2>&1 </dev/null &
+  nohup npx tsx src/index.ts >>"$RUNNER_LOG_FILE" 2>&1 </dev/null &
   echo "$!" >"$PID_FILE"
 )
 PID="$(cat "$PROJECT_DIR/$PID_FILE")"
 echo "机器人已启动（pid ${PID}）"
-echo "日志文件：$PROJECT_DIR/$LOG_FILE"
+echo "日志目录：$PROJECT_DIR/$RUN_DIR"

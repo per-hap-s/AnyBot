@@ -6,6 +6,9 @@ import path from "node:path";
 
 import type { IncomingMessage } from "./types.js";
 import { parseIncomingImageKey, getImageExtension, parseReplyPayload } from "./message.js";
+import { includeContentInLogs, logger, rawLogString } from "./logger.js";
+
+const shouldLogContent = includeContentInLogs();
 
 export function createLarkClients(appId: string, appSecret: string) {
   const client = new Lark.Client({ appId, appSecret });
@@ -22,6 +25,15 @@ export async function sendText(
   chatId: string,
   text: string,
 ): Promise<void> {
+  logger.debug("lark.send_text", {
+    chatId,
+    textChars: text.length,
+    ...(shouldLogContent
+      ? {
+          text: rawLogString(text),
+        }
+      : {}),
+  });
   await client.im.message.create({
     params: { receive_id_type: "chat_id" },
     data: {
@@ -37,6 +49,10 @@ export async function sendImage(
   chatId: string,
   imagePath: string,
 ): Promise<void> {
+  logger.info("lark.send_image.start", {
+    chatId,
+    imagePath,
+  });
   const upload = await client.im.image.create({
     data: {
       image_type: "message",
@@ -57,6 +73,11 @@ export async function sendImage(
       content: JSON.stringify({ image_key: imageKey }),
     },
   });
+  logger.info("lark.send_image.success", {
+    chatId,
+    imagePath,
+    imageKey,
+  });
 }
 
 export async function sendReply(
@@ -66,6 +87,17 @@ export async function sendReply(
   workdir: string,
 ): Promise<void> {
   const payload = parseReplyPayload(reply, workdir);
+  logger.info("lark.send_reply", {
+    chatId,
+    textChars: payload.text.length,
+    imageCount: payload.imagePaths.length,
+    ...(shouldLogContent
+      ? {
+          reply: rawLogString(reply),
+          text: rawLogString(payload.text),
+        }
+      : {}),
+  });
 
   if (payload.text) {
     await sendText(client, chatId, payload.text);
@@ -89,6 +121,10 @@ export async function sendAckReaction(
 ): Promise<void> {
   if (!emojiType) return;
 
+  logger.debug("lark.send_ack_reaction", {
+    messageId,
+    emojiType,
+  });
   await client.im.messageReaction.create({
     path: { message_id: messageId },
     data: { reaction_type: { emoji_type: emojiType } },
@@ -103,6 +139,12 @@ export async function downloadImageFromMessage(
   if (!imageKey) {
     throw new Error(`无法解析图片消息内容：${message.content}`);
   }
+
+  logger.info("lark.download_image.start", {
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    imageKey,
+  });
 
   const response = await client.im.messageResource.get({
     path: {
@@ -121,5 +163,12 @@ export async function downloadImageFromMessage(
   );
 
   await response.writeFile(filePath);
+  logger.info("lark.download_image.success", {
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    imageKey,
+    filePath,
+    contentType: Array.isArray(contentType) ? contentType[0] : contentType,
+  });
   return filePath;
 }

@@ -130,7 +130,8 @@ export function buildSystemPrompt(options: {
   const parts = [
     [
       "你是在飞书里回复用户的本机 Codex 代理。",
-      "默认简洁、直接、可信，不要装作看到了你没有实际确认的东西。",
+      "默认简洁、直接、可信，语气自然一点，像真人同事，不像机器人播报。",
+      "不要装作看到了你没有实际确认的东西。",
       `当前工作目录：${options.workdir}`,
       `当前 sandbox：${options.sandbox}`,
     ].join("\n"),
