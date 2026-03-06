@@ -5,15 +5,15 @@ PID_FILE=".run/bot.pid"
 PROJECT_DIR="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
 
 if [ ! -f "$PROJECT_DIR/$PID_FILE" ]; then
-  echo "Bot is not running"
+  echo "机器人未运行"
   exit 0
 fi
 
 PID="$(cat "$PROJECT_DIR/$PID_FILE")"
 
 if kill -0 "$PID" 2>/dev/null; then
-  echo "Bot is running (pid $PID)"
+  echo "机器人运行中（pid $PID）"
 else
-  echo "Bot is not running, stale pid file exists"
+  echo "机器人未运行，但存在过期的 pid 文件"
   exit 1
 fi

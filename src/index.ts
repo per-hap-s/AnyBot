@@ -14,6 +14,14 @@ type TextMessageContent = {
   text?: string;
 };
 
+const sandboxModes = [
+  "read-only",
+  "workspace-write",
+  "danger-full-access",
+] as const;
+
+type SandboxMode = (typeof sandboxModes)[number];
+
 type CodexJsonEvent = {
   type?: string;
   thread_id?: string;
@@ -23,11 +31,14 @@ type CodexJsonEvent = {
   };
 };
 
-const requiredEnv = ["FEISHU_APP_ID", "FEISHU_APP_SECRET"] as const;
+const requiredEnv = [
+  "FEISHU_APP_ID",
+  "FEISHU_APP_SECRET",
+] as const;
 
 for (const key of requiredEnv) {
   if (!process.env[key]) {
-    throw new Error(`Missing required environment variable: ${key}`);
+    throw new Error(`缺少必填环境变量：${key}`);
   }
 }
 
@@ -37,12 +48,20 @@ const groupChatMode = process.env.FEISHU_GROUP_CHAT_MODE || "mention";
 const botOpenId = process.env.FEISHU_BOT_OPEN_ID;
 const ackReaction = process.env.FEISHU_ACK_REACTION || "OK";
 const codexBin = process.env.CODEX_BIN || "codex";
-const codexSandbox = process.env.CODEX_SANDBOX || "read-only";
+const codexSandboxRaw = process.env.CODEX_SANDBOX || "read-only";
 const codexModel = process.env.CODEX_MODEL;
 const codexWorkdir = process.env.CODEX_WORKDIR || process.cwd();
 const systemPrompt =
   process.env.CODEX_SYSTEM_PROMPT ||
-  "You are Codex replying inside Feishu. Be concise by default.";
+  "你是在飞书里回复的 Codex。默认简洁回答。";
+
+if (!sandboxModes.includes(codexSandboxRaw as SandboxMode)) {
+  throw new Error(
+    `CODEX_SANDBOX 配置无效：${codexSandboxRaw}。可选值只有：${sandboxModes.join("、")}`,
+  );
+}
+
+const codexSandbox = codexSandboxRaw as SandboxMode;
 
 const larkClient = new Lark.Client({
   appId,
@@ -106,7 +125,7 @@ Reply to the latest USER message only.`;
 
   const outputText = await runCodex(prompt);
   if (!outputText) {
-    throw new Error("Codex returned an empty response");
+    throw new Error("Codex 返回了空内容");
   }
 
   const nextHistory = trimHistory([
@@ -160,7 +179,7 @@ async function runCodex(prompt: string): Promise<string> {
 
     child.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`Codex exited with code ${code}: ${stderr || stdout}`));
+        reject(new Error(`Codex 进程退出，状态码 ${code}：${stderr || stdout}`));
         return;
       }
 
@@ -189,7 +208,7 @@ async function runCodex(prompt: string): Promise<string> {
 
       const lastMessage = messages.at(-1);
       if (!lastMessage) {
-        reject(new Error(`Unable to parse Codex output: ${stdout}`));
+        reject(new Error(`无法解析 Codex 输出：${stdout}`));
         return;
       }
 
@@ -244,14 +263,14 @@ async function processMessage(message: {
   try {
     await sendAckReaction(message.message_id);
   } catch (error) {
-    console.error("Failed to send ack reaction", error);
+    console.error("发送已收到 reaction 失败", error);
   }
 
   try {
     const reply = await generateReply(message.chat_id, userText);
     await sendText(message.chat_id, reply);
   } catch (error) {
-    console.error("Failed to handle message", error);
+    console.error("处理消息失败", error);
     await sendText(message.chat_id, "处理消息时出错了，请稍后再试。");
   }
 }
@@ -304,14 +323,14 @@ const dispatcher = new Lark.EventDispatcher({}).register({
 });
 
 async function main(): Promise<void> {
-  console.log("Starting Feishu bot bridge...");
+  console.log("正在启动飞书机器人桥接服务...");
   await wsClient.start({
     eventDispatcher: dispatcher,
   });
-  console.log("Feishu bot bridge started.");
+  console.log("飞书机器人桥接服务已启动。");
 }
 
 main().catch((error) => {
-  console.error("Fatal startup error", error);
+  console.error("启动失败", error);
   process.exit(1);
 });

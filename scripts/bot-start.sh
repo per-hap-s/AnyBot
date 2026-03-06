@@ -11,7 +11,7 @@ mkdir -p "$PROJECT_DIR/$RUN_DIR"
 if [ -f "$PROJECT_DIR/$PID_FILE" ]; then
   PID="$(cat "$PROJECT_DIR/$PID_FILE")"
   if kill -0 "$PID" 2>/dev/null; then
-    echo "Bot already running (pid $PID)"
+    echo "机器人已在运行（pid $PID）"
     exit 0
   fi
   rm -f "$PROJECT_DIR/$PID_FILE"
@@ -23,5 +23,5 @@ fi
   echo "$!" >"$PID_FILE"
 )
 PID="$(cat "$PROJECT_DIR/$PID_FILE")"
-echo "Bot started (pid $PID)"
-echo "Log: $PROJECT_DIR/$LOG_FILE"
+echo "机器人已启动（pid $PID）"
+echo "日志文件：$PROJECT_DIR/$LOG_FILE"
