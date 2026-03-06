@@ -10,6 +10,62 @@ import { includeContentInLogs, logger, rawLogString } from "./logger.js";
 
 const shouldLogContent = includeContentInLogs();
 
+function toInteractiveCardContent(text: string): string {
+  return JSON.stringify({
+    config: {
+      wide_screen_mode: true,
+      enable_forward: true,
+    },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: "黑墙 回复",
+      },
+      template: "blue",
+    },
+    elements: [
+      {
+        tag: "div",
+        text: {
+          tag: "lark_md",
+          content: text,
+        },
+      },
+    ],
+  });
+}
+
+async function sendPlainText(
+  client: Lark.Client,
+  chatId: string,
+  text: string,
+): Promise<void> {
+  await client.im.message.create({
+    params: { receive_id_type: "chat_id" },
+    data: {
+      receive_id: chatId,
+      msg_type: "text",
+      content: JSON.stringify({ text }),
+    },
+  });
+}
+
+function formatCardFallbackText(text: string): string {
+  return text.length > 300 ? `${text.slice(0, 300)}...` : text;
+}
+
+function isCardContentError(error: unknown): boolean {
+  const maybeError = error as {
+    code?: number;
+    msg?: string;
+    message?: string;
+    response?: { code?: number; msg?: string };
+  };
+  const code = maybeError.code ?? maybeError.response?.code;
+  const message = maybeError.msg || maybeError.response?.msg || maybeError.message || "";
+  return code === 230028 || /interactive|card|content/i.test(message);
+}
+
 export function createLarkClients(appId: string, appSecret: string) {
   const client = new Lark.Client({ appId, appSecret });
   const wsClient = new Lark.WSClient({
@@ -38,9 +94,18 @@ export async function sendText(
     params: { receive_id_type: "chat_id" },
     data: {
       receive_id: chatId,
-      msg_type: "text",
-      content: JSON.stringify({ text }),
+      msg_type: "interactive",
+      content: toInteractiveCardContent(text),
     },
+  }).catch(async (error: unknown) => {
+    if (!isCardContentError(error)) {
+      throw error;
+    }
+    logger.warn("lark.send_text.card_fallback", {
+      chatId,
+      error: (error as { message?: string })?.message || String(error),
+    });
+    await sendPlainText(client, chatId, formatCardFallbackText(text));
   });
 }
 
