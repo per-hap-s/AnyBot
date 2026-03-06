@@ -11,9 +11,17 @@ import { buildSkillsPromptSection } from "./skills.js";
 
 const CORE_PROMPT_FILE_ORDER = [
   "AGENTS.md",
-  "PROFILE.md",
   "SOUL.md",
+  "PROFILE.md",
 ] as const;
+
+// 文件名 → 语义化标题，AI 更容易理解每段职责
+const SECTION_TITLES: Record<string, string> = {
+  "AGENTS.md": "行为规则",
+  "SOUL.md": "身份与风格",
+  "PROFILE.md": "用户偏好",
+  "MEMORY.md": "项目记忆",
+};
 
 const OPTIONAL_PROMPT_FILE_ORDER = ["MEMORY.md"] as const;
 
@@ -96,7 +104,7 @@ function shouldIncludeMemory(conversationText?: string): boolean {
     return false;
   }
 
-  return /(```|`[^`]+`|\/|\\|\.([cm]?[jt]sx?|py|md|json|yaml|yml|env)\b|npm\b|node\b|git\b|bash\b|shell\b|代码|仓库|项目|文件|目录|路径|环境变量|命令|日志|报错|错误|测试|调试|实现|重构|优化|提示词|上下文|记忆|飞书|机器人|Codex|prompt|memory|profile|agent|sandbox)/i.test(
+  return /(```|`[^`]+`|\/|\\|\.([cm]?[jt]sx?|py|md|json|yaml|yml|env)\b|npm\b|node\b|git\b|bash\b|shell\b|代码|仓库|项目|文件|目录|路径|环境变量|命令|日志|报错|错误|测试|调试|实现|重构|优化|提示词|上下文|记忆|飞书|机器人|Codex|prompt|memory|profile|agent|sandbox|记住|忘掉|忘记|删掉|人设|风格|偏好|规则|叫我|你叫)/i.test(
     normalized,
   );
 }
@@ -114,7 +122,8 @@ function loadPromptSections(
       continue;
     }
 
-    sections.push(`# ${filename}\n\n${content}`);
+    const title = SECTION_TITLES[filename] || filename;
+    sections.push(`# ${title}\n\n${content}`);
   }
 
   if (shouldIncludeMemory(conversationText)) {
@@ -141,8 +150,8 @@ function buildBootstrapBlock(workdir: string, sandbox: string): string | null {
 
   const persistenceHint =
     sandbox === "read-only"
-      ? "当前 sandbox 是 read-only，所以你不能真正写回文件。需要明确告诉用户：你可以先完成引导，但只有在可写权限下才能持久保存到 PROFILE.md / MEMORY.md。"
-      : "当前 sandbox 允许写入。引导过程中一旦拿到稳定信息，就直接更新工作目录中的 PROFILE.md / MEMORY.md，避免只记在聊天上下文里。";
+      ? "当前 sandbox 是 read-only，不能写回文件。告诉用户：引导可以先完成，但需要可写权限才能持久保存到 PROFILE.md / MEMORY.md / SOUL.md。"
+      : "当前 sandbox 允许写入。拿到稳定信息后直接更新工作目录中的 PROFILE.md / MEMORY.md / SOUL.md，不要只记在聊天上下文里。";
 
   return [
     "# BOOTSTRAP MODE",
@@ -172,10 +181,7 @@ export function buildSystemPrompt(options: {
   ensureWorkspacePromptFiles(options.workdir, templateDir);
 
   const parts = [
-    [
-      `当前工作目录：${options.workdir}`,
-      `当前 sandbox：${options.sandbox}`,
-    ].join("\n"),
+    `[环境] 工作目录=${options.workdir} sandbox=${options.sandbox}`,
   ];
 
   if (options.extraPrompt?.trim()) {

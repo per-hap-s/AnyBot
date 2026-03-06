@@ -175,12 +175,12 @@ async function generateReply(
     .join("\n\n");
   const prompt = `${systemPrompt}
 
-Conversation so far:
+以下是对话历史：
 ${transcript}
 
-Reply to the latest USER message only.
-When you create or reference an image that should be sent back to the user in Feishu, include the image file path in your final reply. Prefer an absolute path or Markdown image syntax like ![label](/absolute/path.png). Relative paths are resolved from the working directory.
-When you need the bot to send a non-image file to the user, include one line per file in the exact format: FILE: /absolute/or/relative/path.ext`;
+只回复最新一条 USER 消息。
+如果需要发送图片给用户，在回复中包含图片绝对路径或 Markdown 图片语法 ![描述](/绝对路径.png)。相对路径基于工作目录解析。
+如果需要发送非图片文件，每个文件单独一行，格式：FILE: /绝对路径/文件名.扩展名`;
 
   logger.info("reply.generate.start", {
     chatId,
