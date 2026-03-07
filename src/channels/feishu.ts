@@ -49,6 +49,7 @@ export class FeishuChannel implements IChannel {
   private handledMessageIds = new CappedSet<string>(MAX_HANDLED_IDS);
   private queueByChat = new Map<string, Promise<void>>();
   private codexWorkdir = process.env.CODEX_WORKDIR || process.cwd();
+  private startedAtMs: number = 0;
 
   async start(callbacks: ChannelCallbacks): Promise<void> {
     const config = readChannelConfig<FeishuChannelConfig>("feishu");
@@ -63,6 +64,7 @@ export class FeishuChannel implements IChannel {
 
     this.config = config;
     this.callbacks = callbacks;
+    this.startedAtMs = Date.now();
 
     const { client, wsClient, EventDispatcher } = createLarkClients(
       config.appId,
@@ -76,6 +78,7 @@ export class FeishuChannel implements IChannel {
         sender: { sender_type: string };
         message: {
           message_id: string;
+          create_time?: string;
           chat_id: string;
           chat_type: string;
           message_type: string;
@@ -135,6 +138,7 @@ export class FeishuChannel implements IChannel {
     sender: { sender_type: string };
     message: {
       message_id: string;
+      create_time?: string;
       chat_id: string;
       chat_type: string;
       message_type: string;
@@ -159,6 +163,18 @@ export class FeishuChannel implements IChannel {
     });
 
     if (sender.sender_type === "app") return;
+
+    const messageCreatedAtMs = message.create_time
+      ? Number(message.create_time)
+      : 0;
+    if (messageCreatedAtMs > 0 && messageCreatedAtMs < this.startedAtMs) {
+      logger.info("feishu.message.skipped_stale", {
+        messageId: message.message_id,
+        messageCreatedAt: messageCreatedAtMs,
+        serviceStartedAt: this.startedAtMs,
+      });
+      return;
+    }
 
     if (this.handledMessageIds.has(message.message_id)) return;
     this.handledMessageIds.add(message.message_id);
