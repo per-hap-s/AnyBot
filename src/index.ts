@@ -44,7 +44,6 @@ const codexBin = process.env.CODEX_BIN || "codex";
 const codexSandboxRaw = process.env.CODEX_SANDBOX || "read-only";
 const codexModel = process.env.CODEX_MODEL;
 const codexWorkdir = process.env.CODEX_WORKDIR || process.cwd();
-const codexPromptTemplateDir = process.env.CODEX_PROMPT_DIR;
 const codexSkillsDir = process.env.CODEX_SKILLS_DIR;
 const extraSystemPrompt = process.env.CODEX_SYSTEM_PROMPT;
 const shouldLogContent = includeContentInLogs();
@@ -58,13 +57,11 @@ if (!sandboxModes.includes(codexSandboxRaw as SandboxMode)) {
 
 const codexSandbox = codexSandboxRaw as SandboxMode;
 
-function getSystemPrompt(conversationText?: string): string {
+function getSystemPrompt(): string {
   return buildSystemPrompt({
     workdir: codexWorkdir,
     sandbox: codexSandbox,
     extraPrompt: extraSystemPrompt,
-    templateDir: codexPromptTemplateDir,
-    conversationText,
     skillsDir: codexSkillsDir,
   });
 }
@@ -166,10 +163,7 @@ async function generateReply(
   historyText = userText,
 ): Promise<string> {
   const history = historyByChat.get(chatId) || [];
-  const promptContext = [...history.slice(-4), { role: "user" as const, content: historyText }]
-    .map((turn) => turn.content)
-    .join("\n");
-  const systemPrompt = getSystemPrompt(promptContext);
+  const systemPrompt = getSystemPrompt();
   const transcript = [...history, { role: "user" as const, content: historyText }]
     .map((turn) => `${turn.role.toUpperCase()}: ${turn.content}`)
     .join("\n\n");
@@ -458,7 +452,6 @@ async function main(): Promise<void> {
     codexSandbox,
     codexModel: codexModel || null,
     codexWorkdir,
-    promptTemplateDir: codexPromptTemplateDir || null,
     skillsDir: codexSkillsDir || null,
     extraSystemPrompt: extraSystemPrompt ? "<set>" : null,
     logIncludeContent: shouldLogContent,
