@@ -115,6 +115,7 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunCodexResult> {
       cwd: workdir,
       env: process.env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
     });
 
     let stdout = "";
@@ -122,11 +123,19 @@ export async function runCodex(opts: RunCodexOptions): Promise<RunCodexResult> {
     let killed = false;
     let startedThreadId: string | null = null;
 
+    const killProcessGroup = (signal: NodeJS.Signals) => {
+      try {
+        if (child.pid) process.kill(-child.pid, signal);
+      } catch {
+        child.kill(signal);
+      }
+    };
+
     const timer = setTimeout(() => {
       killed = true;
-      child.kill("SIGTERM");
+      killProcessGroup("SIGTERM");
       setTimeout(() => {
-        if (!child.killed) child.kill("SIGKILL");
+        if (!child.killed) killProcessGroup("SIGKILL");
       }, 3000);
     }, timeoutMs);
 
