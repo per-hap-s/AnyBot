@@ -1,80 +1,273 @@
 # CodexDesktopControl
 
-`CodexDesktopControl` 用飞书长连接模式把飞书机器人接到本机的 `codex` CLI，让你可以直接在飞书里把消息转给这台机器上的 Codex。
+把 [OpenAI Codex CLI](https://github.com/openai/codex) 变成可远程使用的 AI 助手——通过内置 **Web UI** 在浏览器里对话，或通过 **飞书机器人** 在手机 / 桌面端随时向你这台机器上的 Codex 发消息。
 
-## 功能
+支持 **macOS** 和 **Linux**。
 
-- 通过飞书长连接接收 `im.message.receive_v1` 事件
-- 把用户发来的文本或图片转发给本地 `codex exec`
-- 由机器人把结果回复回飞书
-- 按会话复用 Codex 原生 session，只有 `/new` 才重新开会话
-- 默认在私聊直接回复，在群聊里仅被 @ 时回复
+---
 
-## 配置步骤
+## 特性
 
-1. 复制 `.env.example` 为 `.env`
-2. 填写以下配置：
-   - `FEISHU_APP_ID`
-   - `FEISHU_APP_SECRET`
-   - 如果需要，再填写 `CODEX_WORKDIR`
-3. 安装依赖：
+- **Web UI** — 开箱即用的本地聊天界面，支持 Markdown 渲染、代码高亮、会话管理
+- **飞书集成** — 长连接模式接入飞书，手机上也能用 Codex
+- **会话续聊** — 复用 Codex 原生 session，上下文不丢失；输入 `/new` 开启新会话
+- **图片理解** — 发送图片给 Codex，支持多模态对话
+- **文件回传** — Codex 生成的图片、文件自动发送回聊天
+- **模型切换** — 在 Web UI 中随时切换模型
+- **后台运行** — 支持 daemon 模式，开机即用
+- **一键配置** — 交互式 `setup.sh` 引导完成所有配置
+
+---
+
+## 快速开始
+
+### 1. 前置依赖
+
+| 依赖 | 最低版本 | 说明 |
+|------|---------|------|
+| [Node.js](https://nodejs.org/) | 18+ | 运行环境 |
+| npm | 随 Node.js 附带 | 包管理 |
+| [Codex CLI](https://github.com/openai/codex) | — | `npm install -g @openai/codex` |
+
+<details>
+<summary><b>Linux 安装指南</b></summary>
+
+**Ubuntu / Debian：**
 
 ```bash
-npm install --prefix /Users/erhu/code/python/CodexDesktopControl
+curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+sudo apt-get install -y nodejs
 ```
 
-4. 启动机器人：
+**CentOS / RHEL / Fedora：**
 
 ```bash
-npm run start --prefix /Users/erhu/code/python/CodexDesktopControl
+curl -fsSL https://rpm.nodesource.com/setup_lts.x | sudo bash -
+sudo yum install -y nodejs   # Fedora 用 dnf
 ```
 
-也可以使用后台控制脚本：
+**使用 nvm（推荐，不需要 sudo）：**
 
 ```bash
-npm run bot:start --prefix /Users/erhu/code/python/CodexDesktopControl
-npm run bot:status --prefix /Users/erhu/code/python/CodexDesktopControl
-npm run bot:stop --prefix /Users/erhu/code/python/CodexDesktopControl
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
+source ~/.bashrc   # 或 source ~/.zshrc
+nvm install --lts
 ```
 
-## 飞书侧必需配置
+**安装 Codex CLI：**
 
-在飞书开放平台应用设置里：
+```bash
+npm install -g @openai/codex
+```
 
-- 开启机器人能力
-- 开启长连接模式的事件订阅
-- 订阅 `im.message.receive_v1`
-- 给机器人开通发送消息权限
-- 如果要处理用户发来的图片，还需要开通读取消息资源相关权限
-- 配置完成后发布应用
+</details>
 
-## 环境变量说明
+<details>
+<summary><b>macOS 安装指南</b></summary>
 
-- `FEISHU_GROUP_CHAT_MODE`：可选值是 `mention` 或 `all`
-- `FEISHU_BOT_OPEN_ID`：可选。用于在 `mention` 模式下只响应“明确 @ 机器人本身”的消息；如果不填，只要消息里带 @ 就可能触发回复。
-- `FEISHU_ACK_REACTION`：机器人收到消息后，立即给原消息加的 reaction，默认是 `OK`；留空可关闭。
-- `CODEX_BIN`：默认为 `codex`
-- `CODEX_MODEL`：可选，用于覆盖 `codex exec` 的模型参数
-- `CODEX_SANDBOX`：可选，默认是 `read-only`。只允许 `read-only`、`workspace-write`、`danger-full-access` 这 3 个值，会原样传给 `codex exec -s`。
-- `CODEX_SYSTEM_PROMPT`：可选。额外追加到内置提示词后的系统提示词
-- `CODEX_WORKDIR`：传给 `codex exec` 的工作目录
-- `LOG_LEVEL`：可选。日志级别，支持 `debug`、`info`、`warn`、`error`，默认 `info`
-- `LOG_INCLUDE_CONTENT`：可选。设为 `true` 后，日志会包含飞书原始消息内容、清洗后的用户文本、实际回复文本
-- `LOG_INCLUDE_PROMPT`：可选。设为 `true` 后，日志会额外包含最终发给 `codex` 的完整 prompt
+```bash
+brew install node
+npm install -g @openai/codex
+```
 
-## 说明
+</details>
 
-- 每个飞书 chat 会在本进程内绑定一个 Codex `thread_id`，后续消息通过 `codex exec resume` 续聊，不再由桥接层手工拼接历史
-- 当前绑定关系只保存在内存里，进程重启后会丢失；重启后该 chat 的下一条消息会自动创建新的 Codex 会话
-- 机器人会先给你的消息加一个“已收到”的 reaction，再生成完整回复
-- 当前支持接收文本消息和图片消息；其它类型仍会返回兜底提示
-- 文本消息输入 `/new` 会丢弃当前 chat 绑定的 Codex 会话，并回复“新窗口已开启”
-- 图片消息会先下载到本机临时目录，再通过 `codex exec -i` 作为输入图片交给模型
-- 如果 Codex 的最终回复里包含本机图片绝对路径，或 `![alt](/absolute/path.png)` 这种 Markdown 图片，机器人会自动上传并发送该图片
-- 如果 Codex 的最终回复里包含形如 `FILE: /absolute/or/relative/path.ext` 的行，机器人会把该本机文件上传并作为飞书文件消息发送（`xlsx/docx/txt` 等均可）
-- 飞书文件上传单个文件大小上限是 30MB，且不能是空文件
-- 长连接模式不需要公网回调地址
-- 这台机器本地需要先能正常使用 `codex`
-- 运行日志是单行 JSON，默认会记录消息接收、过滤、Codex 调用耗时、飞书回复与异常上下文；排查问题时可把 `LOG_LEVEL` 调到 `debug`
-- 如果你需要排查“飞书到底发来了什么、机器人最终回了什么、送给 codex 的 prompt 是什么”，可以同时开启 `LOG_INCLUDE_CONTENT=true` 和 `LOG_INCLUDE_PROMPT=true`
-- 应用日志默认写到 `.run/` 目录，文件名格式是 `bot.log.YYYYMMDD-HHMM`，按 10 分钟切分；`scripts/bot-start.sh` 的控制台输出单独写到 `.run/bot.runner.log`
+### 2. 克隆与配置
+
+```bash
+git clone https://github.com/1935417243/CodexDesktopControl.git
+cd CodexDesktopControl
+sh setup.sh
+```
+
+`setup.sh` 会引导你完成：
+- 检测操作系统与依赖
+- 设置 Codex 工作目录
+- 选择安全模式（只读 / 可写 / 完全访问）
+- 配置 Web UI 端口
+- 生成 `.env` 配置文件
+- 安装 npm 依赖
+
+### 3. 启动
+
+```bash
+# 前台运行
+npm start
+
+# 后台运行（daemon）
+npm run bot:start
+
+# 查看状态
+npm run bot:status
+
+# 停止
+npm run bot:stop
+```
+
+启动后打开 `http://localhost:19981` 即可使用 Web UI。
+
+### 4. 手动配置（可选）
+
+如果不想使用引导脚本：
+
+```bash
+cp .env.example .env
+# 编辑 .env，按需填写配置
+npm install
+npm start
+```
+
+---
+
+## Web UI
+
+内置的 Web 聊天界面，无需额外部署：
+
+- 多会话管理，历史记录持久化（SQLite）
+- Markdown 渲染 + 代码语法高亮 + 一键复制
+- 模型切换
+- 频道配置管理（飞书等）
+- 深色主题
+
+---
+
+## 飞书集成
+
+通过飞书长连接模式接入，**无需公网回调地址**。
+
+### 飞书侧配置
+
+在 [飞书开放平台](https://open.feishu.cn/) 创建应用后：
+
+1. 开启 **机器人** 能力
+2. 开启 **长连接模式** 的事件订阅
+3. 订阅事件 `im.message.receive_v1`
+4. 授予 **发送消息** 权限
+5. 如需处理图片消息，还需授予 **读取消息资源** 相关权限
+6. 发布应用
+
+### 连接配置
+
+频道配置保存在 `.data/channels.json`，有三种方式管理：
+
+| 方式 | 说明 |
+|------|------|
+| **Web UI** | 启动服务后在设置页面中配置 App ID / App Secret |
+| **REST API** | `GET /api/channels` 查看、`PUT /api/channels/:type` 更新 |
+| **手动编辑** | 直接编辑 `.data/channels.json` |
+
+<details>
+<summary><b>channels.json 完整字段说明</b></summary>
+
+```jsonc
+{
+  "feishu": {
+    "enabled": true,
+    "appId": "cli_xxxx",
+    "appSecret": "xxxx",
+    "groupChatMode": "mention",   // "mention"（仅 @机器人时回复）或 "all"（所有消息都回复）
+    "botOpenId": "ou_xxxx",       // 可选；mention 模式下用于精确判断是否 @了机器人
+    "ackReaction": "OK"           // 收到消息后的 reaction 表情，留空可关闭
+  }
+}
+```
+
+</details>
+
+### 使用方式
+
+- **私聊** — 直接发消息给机器人
+- **群聊** — 默认仅 @ 机器人时回复（可改为回复所有消息）
+- 发送 `/new` — 重置当前会话
+- 发送图片 — 自动下载并交给 Codex 处理
+- Codex 回复中的图片 / 文件会自动上传回飞书（单文件上限 30MB）
+
+---
+
+## 环境变量
+
+在 `.env` 文件中配置（通过 `setup.sh` 生成或手动从 `.env.example` 复制）。
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `CODEX_BIN` | `codex` | Codex CLI 可执行文件路径 |
+| `CODEX_MODEL` | — | 覆盖 `codex exec` 使用的模型 |
+| `CODEX_SANDBOX` | `read-only` | 安全模式：`read-only` / `workspace-write` / `danger-full-access` |
+| `CODEX_SYSTEM_PROMPT` | — | 追加到内置提示词后面的自定义系统提示词 |
+| `CODEX_WORKDIR` | 当前目录 | Codex 的工作目录 |
+| `WEB_PORT` | `19981` | Web UI 端口 |
+| `LOG_LEVEL` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
+| `LOG_INCLUDE_CONTENT` | `false` | 日志中包含消息内容（调试用） |
+| `LOG_INCLUDE_PROMPT` | `false` | 日志中包含完整 prompt（调试用） |
+
+---
+
+## REST API
+
+Web UI 通过以下 API 与后端交互，也可以直接调用：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/sessions` | 获取会话列表 |
+| `POST` | `/api/sessions` | 创建新会话 |
+| `GET` | `/api/sessions/:id` | 获取会话详情（含消息） |
+| `DELETE` | `/api/sessions/:id` | 删除会话 |
+| `POST` | `/api/sessions/:id/messages` | 发送消息 `{ "content": "..." }` |
+| `GET` | `/api/model-config` | 获取当前模型配置 |
+| `PUT` | `/api/model-config` | 切换模型 `{ "modelId": "..." }` |
+| `GET` | `/api/channels` | 获取频道配置 |
+| `PUT` | `/api/channels/:type` | 更新频道配置 |
+
+---
+
+## 工作原理
+
+- 每个聊天（Web 会话 / 飞书 chat）绑定一个 Codex `thread_id`，后续消息通过 `codex exec resume` 续聊
+- 会话绑定关系保存在 SQLite 中；飞书频道的绑定在进程重启后自动重建
+- 飞书消息先加一个 reaction（默认 ✅）表示已收到，再等待 Codex 完整回复
+- 支持文本和图片消息；其它消息类型会收到提示
+- `/new` 重置当前会话
+- 图片消息先下载到临时目录，通过 `codex exec -i` 传入
+- 回复中的本机图片路径（`![alt](/path.png)` 或纯路径）会自动上传
+- 回复中的 `FILE: /path/to/file.ext` 会作为文件发送
+- 日志为单行 JSON，写入 `.run/` 目录，按 10 分钟切分
+
+---
+
+## 项目结构
+
+```
+CodexDesktopControl/
+├── src/
+│   ├── index.ts          # 主入口，会话状态管理
+│   ├── codex.ts          # Codex CLI 子进程封装
+│   ├── lark.ts           # 飞书 API（消息、文件、图片）
+│   ├── logger.ts         # 结构化日志
+│   ├── message.ts        # 消息解析（输入输出）
+│   ├── prompt.ts         # 系统提示词构建
+│   ├── types.ts          # 类型定义
+│   ├── channels/         # 频道管理（飞书等）
+│   │   ├── index.ts      # ChannelManager
+│   │   ├── feishu.ts     # 飞书频道实现
+│   │   ├── config.ts     # channels.json 读写
+│   │   └── types.ts      # 频道接口定义
+│   └── web/              # Web 层
+│       ├── server.ts     # Express 服务
+│       ├── api.ts        # REST API
+│       ├── db.ts         # SQLite 持久化
+│       ├── model-config.ts # 模型配置
+│       └── public/       # 前端静态文件
+├── scripts/              # daemon 控制脚本
+│   ├── bot-start.sh
+│   ├── bot-stop.sh
+│   └── bot-status.sh
+├── setup.sh              # 交互式配置引导
+├── .env.example          # 环境变量模板
+└── package.json
+```
+
+---
+
+## License
+
+MIT
