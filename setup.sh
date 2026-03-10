@@ -136,6 +136,24 @@ if [ ! -d "$WORKDIR" ]; then
 fi
 ok "工作目录: $WORKDIR"
 
+# ── Copy default md files to workspace ────────────────────────────────
+
+MD_SRC="$PROJECT_DIR/src/agent/md_files"
+COPIED_FILES=""
+
+for f in AGENTS.md MEMORY.md PROFILE.md BOOTSTRAP.md; do
+  if [ -f "$WORKDIR/$f" ]; then
+    info "$f 已存在于工作目录，跳过"
+  else
+    cp "$MD_SRC/$f" "$WORKDIR/$f"
+    COPIED_FILES="$COPIED_FILES $f"
+  fi
+done
+
+if [ -n "$COPIED_FILES" ]; then
+  ok "已复制默认配置文件到工作目录:$COPIED_FILES"
+fi
+
 # ── Configure sandbox mode ───────────────────────────────────────────
 
 echo ""
