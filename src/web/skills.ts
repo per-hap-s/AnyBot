@@ -76,18 +76,26 @@ function parseSkillMd(content: string): { name: string; description: string } {
 
 function scanSkillDir(dir: string): Array<{ name: string; skillPath: string }> {
   const results: Array<{ name: string; skillPath: string }> = [];
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const skillMd = path.join(dir, entry.name, "SKILL.md");
-      if (fs.existsSync(skillMd)) {
-        results.push({ name: entry.name, skillPath: skillMd });
+
+  function scan(currentDir: string): void {
+    try {
+      const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const subDir = path.join(currentDir, entry.name);
+        const skillMd = path.join(subDir, "SKILL.md");
+        if (fs.existsSync(skillMd)) {
+          results.push({ name: entry.name, skillPath: skillMd });
+        } else if (entry.name.startsWith(".")) {
+          scan(subDir);
+        }
       }
+    } catch {
+      // dir not readable
     }
-  } catch {
-    // dir not readable
   }
+
+  scan(dir);
   return results;
 }
 
