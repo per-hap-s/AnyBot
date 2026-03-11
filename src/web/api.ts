@@ -199,7 +199,7 @@ export function chatRouter(): Router {
 
   router.post("/skills/open-folder", (req: Request, res: Response) => {
     try {
-      const { path: skillPath } = req.body as { path?: string };
+      const skillPath = req.body?.path as string | undefined;
       openSkillsFolder(skillPath);
       res.json({ ok: true });
     } catch (error) {

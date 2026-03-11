@@ -2450,7 +2450,11 @@
             openFolderBtn.title = '打开文件夹';
             openFolderBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="none"><path d="M1.5 3.5v7a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1v-5a1 1 0 0 0-1-1H7L5.5 3.5H2.5a1 1 0 0 0-1 1z" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/></svg>';
             openFolderBtn.addEventListener('click', function () {
-                fetch('/api/skills/open-folder', { method: 'POST' });
+                fetch('/api/skills/open-folder', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({}),
+                });
             });
 
             toolbar.appendChild(searchInput);
