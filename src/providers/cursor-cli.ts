@@ -400,7 +400,11 @@ export class CursorCliProvider implements IProvider {
     const workspace = this.workspace || opts.workdir;
     args.push("--workspace", workspace);
 
-    if (opts.sandbox === "danger-full-access" || opts.sandbox === "workspace-write") {
+    if (
+      opts.sandbox === "danger-full-access" ||
+      opts.sandbox === "workspace-write" ||
+      process.platform === "linux"
+    ) {
       args.push("--sandbox", "disabled");
     } else {
       args.push("--sandbox", "enabled");
