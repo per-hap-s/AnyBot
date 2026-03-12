@@ -1,6 +1,7 @@
 import type { IProvider } from "./types.js";
 import { CodexProvider } from "./codex.js";
 import { GeminiCliProvider } from "./gemini-cli.js";
+import { CursorCliProvider } from "./cursor-cli.js";
 
 type ProviderFactory = (config?: Record<string, unknown>) => IProvider;
 
@@ -10,6 +11,12 @@ const providerFactories: Record<string, ProviderFactory> = {
     new GeminiCliProvider({
       bin: config?.bin as string | undefined,
       approvalMode: config?.approvalMode as string | undefined,
+    }),
+  "cursor-cli": (config) =>
+    new CursorCliProvider({
+      bin: config?.bin as string | undefined,
+      workspace: config?.workspace as string | undefined,
+      apiKey: config?.apiKey as string | undefined,
     }),
 };
 
@@ -56,6 +63,7 @@ export type {
 } from "./types.js";
 export { CodexProvider } from "./codex.js";
 export { GeminiCliProvider } from "./gemini-cli.js";
+export { CursorCliProvider } from "./cursor-cli.js";
 export {
   ProviderTimeoutError,
   ProviderProcessError,

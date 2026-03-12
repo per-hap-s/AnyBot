@@ -39,6 +39,12 @@ function getProviderConfig(type: string): Record<string, unknown> {
         bin: process.env.GEMINI_CLI_BIN,
         approvalMode: process.env.GEMINI_CLI_APPROVAL_MODE || "yolo",
       };
+    case "cursor-cli":
+      return {
+        bin: process.env.CURSOR_CLI_BIN,
+        workspace: process.env.CURSOR_CLI_WORKSPACE,
+        apiKey: process.env.CURSOR_API_KEY,
+      };
     default:
       return {};
   }
