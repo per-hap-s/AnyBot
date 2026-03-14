@@ -12,6 +12,7 @@ const shouldLogContent = includeContentInLogs();
 
 const TELEGRAM_API = "https://api.telegram.org";
 const POLL_TIMEOUT_SECS = 30;
+const POLL_FETCH_TIMEOUT_MS = (POLL_TIMEOUT_SECS + 15) * 1000;
 const MAX_HANDLED_IDS = 5000;
 const TG_MAX_MESSAGE_LENGTH = 4096;
 
@@ -138,11 +139,17 @@ export class TelegramChannel implements IChannel {
     while (this.polling) {
       try {
         this.pollAbort = new AbortController();
-        const updates: TelegramUpdate[] = await this.apiCall(
-          "getUpdates",
-          { offset, timeout: POLL_TIMEOUT_SECS, allowed_updates: ["message"] },
-          this.pollAbort.signal,
-        );
+        const timer = setTimeout(() => this.pollAbort?.abort(), POLL_FETCH_TIMEOUT_MS);
+        let updates: TelegramUpdate[];
+        try {
+          updates = await this.apiCall(
+            "getUpdates",
+            { offset, timeout: POLL_TIMEOUT_SECS, allowed_updates: ["message"] },
+            this.pollAbort.signal,
+          );
+        } finally {
+          clearTimeout(timer);
+        }
 
         for (const update of updates) {
           offset = update.update_id + 1;
@@ -155,7 +162,11 @@ export class TelegramChannel implements IChannel {
           }
         }
       } catch (error: any) {
-        if (error?.name === "AbortError") break;
+        if (error?.name === "AbortError") {
+          if (!this.polling) break;
+          logger.warn("telegram.poll_timeout", { msg: "long poll timed out, retrying" });
+          continue;
+        }
         logger.error("telegram.poll_error", { error });
         await new Promise((r) => setTimeout(r, 3000));
       }
