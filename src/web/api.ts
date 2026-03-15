@@ -2,7 +2,6 @@ import { Router } from "express";
 import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
-import { fileURLToPath } from "node:url";
 import type { Request, Response } from "express";
 import { getProvider, getRegisteredProviderTypes } from "../providers/index.js";
 import { logger } from "../logger.js";
@@ -40,14 +39,17 @@ function isImageFile(filePath: string): boolean {
   return IMAGE_EXTS.has(path.extname(filePath).toLowerCase());
 }
 
-// 上传目录
-const __apiDirname = path.dirname(fileURLToPath(import.meta.url));
-const UPLOAD_DIR = path.resolve(__apiDirname, "../../tmp/uploads");
-fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+// 上传目录：使用配置的工作目录
+const UPLOAD_DIR = path.join(getWorkdir(), "tmp", "uploads");
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (_) {}
 
 // multer 配置：保留原始扩展名
 const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  destination: (_req, _file, cb) => {
+    // 每次上传时确保目录存在（防止运行中被删除）
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    cb(null, UPLOAD_DIR);
+  },
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname);
     const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_\-\u4e00-\u9fff]/g, "_");
