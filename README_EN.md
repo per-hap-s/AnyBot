@@ -70,6 +70,16 @@ http://localhost:19981
 
 Tray mode is now the recommended Windows entrypoint. It starts and monitors the AnyBot service, exposes quick controls from the system tray, and supports launch-at-login.
 
+The tray config file is stored at `.data/tray-config.json`. Set `serviceAutoStartDelaySeconds` to delay the post-login AnyBot auto-start, for example:
+
+```json
+{
+  "launchAtLogin": true,
+  "serviceAutoStartOnLogin": true,
+  "serviceAutoStartDelaySeconds": 45
+}
+```
+
 Development:
 
 ```bash

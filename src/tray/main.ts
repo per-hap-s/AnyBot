@@ -42,6 +42,7 @@ type WaitForReadyResult =
 type TrayConfig = {
   launchAtLogin: boolean;
   serviceAutoStartOnLogin: boolean;
+  serviceAutoStartDelaySeconds: number;
 };
 
 type TrayLaunchContext = {
@@ -61,6 +62,7 @@ const STATUS_POLL_MS = 5000;
 const START_TIMEOUT_MS = 20000;
 const FAILURE_WINDOW_MS = 2 * 60 * 1000;
 const RESTART_DELAYS_MS = [3000, 10000];
+const DEFAULT_SERVICE_AUTO_START_DELAY_SECONDS = 0;
 const SUMMARY_MAX_LENGTH = 64;
 const WORKDIR_MAX_LENGTH = 68;
 const ERROR_MAX_LENGTH = 42;
@@ -85,7 +87,21 @@ function getDefaultTrayConfig(): TrayConfig {
   return {
     launchAtLogin: true,
     serviceAutoStartOnLogin: true,
+    serviceAutoStartDelaySeconds: DEFAULT_SERVICE_AUTO_START_DELAY_SECONDS,
   };
+}
+
+function normalizeAutoStartDelaySeconds(value: unknown, fallback: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+
+  const normalized = Math.trunc(value);
+  if (normalized < 0) {
+    return 0;
+  }
+
+  return Math.min(normalized, 3600);
 }
 
 function readTrayConfig(runtimeRoot: string): TrayConfig {
@@ -106,6 +122,10 @@ function readTrayConfig(runtimeRoot: string): TrayConfig {
           typeof parsed.serviceAutoStartOnLogin === "boolean"
             ? parsed.serviceAutoStartOnLogin
             : defaultConfig.serviceAutoStartOnLogin,
+        serviceAutoStartDelaySeconds: normalizeAutoStartDelaySeconds(
+          parsed.serviceAutoStartDelaySeconds,
+          defaultConfig.serviceAutoStartDelaySeconds,
+        ),
       };
     } catch {
       nextConfig = defaultConfig;
@@ -306,6 +326,7 @@ class ServiceManager {
   private manualStop = false;
   private statusTimer: NodeJS.Timeout | null = null;
   private restartTimer: NodeJS.Timeout | null = null;
+  private startupDelayTimer: NodeJS.Timeout | null = null;
   private failureTimestamps: number[] = [];
   private trayConfig: TrayConfig;
 
@@ -354,7 +375,11 @@ class ServiceManager {
     }
 
     if (this.shouldAutoStartServiceOnLaunch()) {
-      await this.startService(this.launchContext.forceStartService ? "manual" : "startup");
+      if (this.launchContext.forceStartService) {
+        await this.startService("manual");
+      } else {
+        this.scheduleAutoStartServiceOnLaunch();
+      }
     } else {
       this.setState("stopped", null);
     }
@@ -387,7 +412,15 @@ class ServiceManager {
     }, STATUS_POLL_MS);
   }
 
+  private clearStartupDelayTimer(): void {
+    if (this.startupDelayTimer) {
+      clearTimeout(this.startupDelayTimer);
+      this.startupDelayTimer = null;
+    }
+  }
+
   private clearTimers(): void {
+    this.clearStartupDelayTimer();
     if (this.statusTimer) {
       clearInterval(this.statusTimer);
       this.statusTimer = null;
@@ -459,7 +492,7 @@ class ServiceManager {
     }
 
     items.push({
-      label: `托盘开机自启：${this.getTrayAutoLaunchLabel()} | AnyBot 开机自启：${this.getServiceAutoStartLabel()}`,
+      label: `托盘开机自启：${this.getTrayAutoLaunchLabel()} | AnyBot 开机自启：${this.getServiceAutoStartLabel()} | 延迟：${this.getServiceAutoStartDelayLabel()}`,
       enabled: false,
     });
 
@@ -599,6 +632,14 @@ class ServiceManager {
     return this.getServiceAutoStartOnLoginEnabled() ? "开" : "关";
   }
 
+  private getServiceAutoStartDelaySeconds(): number {
+    return this.trayConfig.serviceAutoStartDelaySeconds;
+  }
+
+  private getServiceAutoStartDelayLabel(): string {
+    return `${this.getServiceAutoStartDelaySeconds()} 秒`;
+  }
+
   private applyLoginItemSetting(enabled: boolean): void {
     let windowsApplied: boolean | null = null;
     if (process.platform === "win32") {
@@ -635,6 +676,9 @@ class ServiceManager {
   }
 
   private toggleServiceAutoStartOnLogin(): void {
+    if (this.trayConfig.serviceAutoStartOnLogin) {
+      this.clearStartupDelayTimer();
+    }
     this.persistTrayConfig({
       ...this.trayConfig,
       serviceAutoStartOnLogin: !this.trayConfig.serviceAutoStartOnLogin,
@@ -747,10 +791,33 @@ class ServiceManager {
     this.setState("stopped", null);
   }
 
+  private scheduleAutoStartServiceOnLaunch(): void {
+    this.clearStartupDelayTimer();
+
+    const delaySeconds = this.getServiceAutoStartDelaySeconds();
+    if (delaySeconds <= 0) {
+      void this.startService("startup");
+      return;
+    }
+
+    this.setState("stopped", null);
+    this.logger.log("info", "service.autostart_scheduled", {
+      delaySeconds,
+      port: this.port,
+    });
+
+    this.startupDelayTimer = setTimeout(() => {
+      this.startupDelayTimer = null;
+      void this.startService("startup");
+    }, delaySeconds * 1000);
+  }
+
   async startService(trigger: "startup" | "manual" | "restart"): Promise<void> {
     if (this.quitting || this.state === "starting" || this.state === "restarting") {
       return;
     }
+
+    this.clearStartupDelayTimer();
 
     const probe = await this.probeService();
     if (probe.kind === "anybot") {
