@@ -1,5 +1,7 @@
 # Memory
 
+Legacy note: this file is deprecated as a memory source. The structured memory store is now the source of truth.
+
 ## Environment
 
 - Workspace root: `D:\CodexProjects\AnyBot`

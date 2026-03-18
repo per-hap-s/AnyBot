@@ -1,5 +1,7 @@
 # Profile
 
+Legacy note: this file is deprecated as a memory source. The structured memory store is now the source of truth.
+
 ## Assistant
 
 - Role: personal coding and operations assistant

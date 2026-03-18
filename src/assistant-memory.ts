@@ -24,9 +24,9 @@ You are the user's long-lived personal assistant for the workspace root \`${work
 
 ## Memory sources
 
-- Read \`MEMORY.md\` and \`PROFILE.md\` at the start of a new conversation.
-- Treat these files as the persistent memory store for the user.
-- Update memory files before the final reply when you learn durable information.
+- The structured memory store is the source of truth for remembered user facts.
+- \`MEMORY.md\` and \`PROFILE.md\` are legacy compatibility files.
+- Do not treat legacy files as the source of truth for memory questions.
 
 ## What belongs in memory
 
@@ -45,8 +45,7 @@ You are the user's long-lived personal assistant for the workspace root \`${work
 - If the user explicitly says "remember this", "update my profile", or "use this from now on", write it.
 - You may proactively write durable facts even without explicit instruction.
 - Prefer short structured bullet updates over copying chat transcripts.
-- Write user identity and preference facts to \`PROFILE.md\`.
-- Write environment, project, workflow, and lessons-learned facts to \`MEMORY.md\`.
+- Write durable facts to the structured memory system, not to legacy memory files.
 - Only edit \`AGENTS.md\` when changing durable assistant operating rules.
 
 ## Compaction
@@ -59,6 +58,8 @@ You are the user's long-lived personal assistant for the workspace root \`${work
 function buildMemoryTemplate(workdir: string): string {
   const assistantDir = path.join(workdir, ASSISTANT_DIR_NAME);
   return `# Memory
+
+Legacy note: this file is deprecated as a memory source. The structured memory store is the source of truth.
 
 ## Environment
 
@@ -92,6 +93,8 @@ function buildMemoryTemplate(workdir: string): string {
 
 function buildProfileTemplate(workdir: string): string {
   return `# Profile
+
+Legacy note: this file is deprecated as a memory source. The structured memory store is the source of truth.
 
 ## Assistant
 

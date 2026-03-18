@@ -31,23 +31,36 @@ function buildOutputContract(source: string): string {
   ].join("\n");
 }
 
-export function buildFirstTurnPrompt(userText: string, source: string = "web"): string {
+function formatMemoryContext(memoryContext?: string): string {
+  const trimmed = memoryContext?.trim();
+  return trimmed ? `Memory context:\n${trimmed}\n\n` : "";
+}
+
+export function buildFirstTurnPrompt(
+  userText: string,
+  source: string = "web",
+  memoryContext?: string,
+): string {
   return `${getSystemPrompt()}
 
-Output requirements:
+${formatMemoryContext(memoryContext)}Output requirements:
 ${buildOutputContract(source)}
 
 User message:
 ${userText}`;
 }
 
-export function buildResumePrompt(userText: string, source: string = "web"): string {
+export function buildResumePrompt(
+  userText: string,
+  source: string = "web",
+  memoryContext?: string,
+): string {
   return `${userText}
 
 Additional requirements:
 ${buildResumeRules(workdir)}
 
-Output requirements:
+${formatMemoryContext(memoryContext)}Output requirements:
 ${buildOutputContract(source)}`;
 }
 

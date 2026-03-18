@@ -35,6 +35,13 @@ import {
 } from "../shared.js";
 import { CONTROL_TOKEN_HEADER } from "../control-token.js";
 import type { ServiceStatusPayload } from "../service-status.js";
+import {
+  buildRelevantMemoryPromptSection,
+  enqueueAutomaticMemoryJobs,
+  isMemoryQuestion,
+  retrieveRelevantCanonicalMemories,
+  resolveUnifiedPrivateMemoryScope,
+} from "../memory/index.js";
 
 const IMAGE_EXTS = new Set([
   ".png",
@@ -167,10 +174,39 @@ function persistUserMessage(
   }
 }
 
-function buildSessionPrompt(session: db.ChatSession, userText: string): string {
+async function buildSessionPrompt(session: db.ChatSession, userText: string): Promise<string> {
+  const scope = resolveUnifiedPrivateMemoryScope("web", session.id);
+  let memoryContext = "";
+
+  if (scope) {
+    try {
+      const hits = await retrieveRelevantCanonicalMemories(scope, userText);
+      logger.info("web.memory.retrieve.completed", {
+        scope,
+        sessionId: session.id,
+        queryChars: userText.length,
+        hitCount: hits.length,
+        hits: hits.map((hit) => ({
+          id: hit.id,
+          text: hit.text,
+          score: Number(hit.score.toFixed(4)),
+        })),
+      });
+      memoryContext = buildRelevantMemoryPromptSection(hits, {
+        isMemoryQuestion: isMemoryQuestion(userText),
+      });
+    } catch (error) {
+      logger.warn("web.memory.retrieve.failed", {
+        scope,
+        sessionId: session.id,
+        error,
+      });
+    }
+  }
+
   return session.sessionId
-    ? buildResumePrompt(userText)
-    : buildFirstTurnPrompt(userText);
+    ? buildResumePrompt(userText, "web", memoryContext)
+    : buildFirstTurnPrompt(userText, "web", memoryContext);
 }
 
 function startNdjsonStream(res: Response): void {
@@ -471,7 +507,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
 
     const prepared = prepareMessageInput(content, attachments);
     persistUserMessage(session, prepared);
-    const prompt = buildSessionPrompt(session, prepared.userText);
+    const prompt = await buildSessionPrompt(session, prepared.userText);
 
     try {
       const provider = getProvider();
@@ -509,6 +545,15 @@ export function chatRouter(options: ApiRouterOptions): Router {
         replyChars: result.text.length,
       });
 
+      if (resolveUnifiedPrivateMemoryScope("web", session.id)) {
+        enqueueAutomaticMemoryJobs({
+          source: "web",
+          chatId: session.id,
+          userText: prepared.userText,
+          assistantText: result.text,
+        });
+      }
+
       res.json({
         role: "assistant",
         content: result.text,
@@ -544,7 +589,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
 
     const prepared = prepareMessageInput(content, attachments);
     persistUserMessage(session, prepared);
-    const prompt = buildSessionPrompt(session, prepared.userText);
+    const prompt = await buildSessionPrompt(session, prepared.userText);
     const provider = getProvider();
     const abortController = new AbortController();
     let completed = false;
@@ -637,6 +682,15 @@ export function chatRouter(options: ApiRouterOptions): Router {
         provider: provider.type,
         replyChars: result.text.length,
       });
+
+      if (resolveUnifiedPrivateMemoryScope("web", session.id)) {
+        enqueueAutomaticMemoryJobs({
+          source: "web",
+          chatId: session.id,
+          userText: prepared.userText,
+          assistantText: result.text,
+        });
+      }
 
       writeStreamEvent(res, {
         type: "assistant",

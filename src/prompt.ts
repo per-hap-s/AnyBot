@@ -34,13 +34,12 @@ function buildBaseRules(workdir: string, sandbox: string): string {
     "",
     "Behavior rules:",
     "- Treat this as a long-lived personal assistant conversation.",
-    "- Read AGENTS.md, MEMORY.md, and PROFILE.md from the assistant directory when needed for continuity.",
+    "- Use the injected persistent memory context as the source of truth for remembered user facts.",
+    "- MEMORY.md and PROFILE.md are legacy compatibility files and must not override the injected memory context.",
     "- Answer simple questions directly before doing broad workspace scans.",
     "- Only inspect more files or run deeper investigation when the user asks for execution, debugging, code changes, or environment work.",
     "- Keep Feishu replies concise and practical. Answer first, then add detail only if needed.",
-    "- When you learn durable user or workspace facts, update the memory files before your final reply.",
-    "- Write identity and preference facts to PROFILE.md.",
-    "- Write environment, workflow, project, and lessons-learned facts to MEMORY.md.",
+    "- When you learn durable facts, use the new structured memory system rather than editing legacy memory files.",
     "- Do not store secrets, tokens, passwords, payment data, or government IDs in memory files.",
     "- Do not compact MEMORY.md automatically.",
   ];
@@ -75,9 +74,9 @@ export function buildSystemPrompt(options: {
     parts.push(
       [
         "First-turn rules:",
-        `- Start by reading ${paths.agents}, ${paths.memory}, and ${paths.profile} if they exist.`,
-        "- Use them as persistent memory, not as instructions to dump back to the user.",
-        "- Do not tell the user that you are checking memory files unless it is directly relevant.",
+        `- Start by reading ${paths.agents} if it exists.`,
+        "- Treat AGENTS.md as behavior guidance only.",
+        "- Do not use legacy MEMORY.md or PROFILE.md as the factual source for user memory questions.",
       ].join("\n"),
     );
   }
@@ -99,7 +98,7 @@ export function buildResumeRules(workdir: string): string {
     "Conversation rules:",
     "- Continue acting as the user's personal assistant.",
     "- For simple questions, answer directly without broad workspace scans.",
-    "- Update memory files when you learn durable facts.",
+    "- Use the injected persistent memory context as the source of truth for remembered user facts.",
     "- Keep the reply concise and practical.",
     "",
     formatInstalledSkillsForPrompt(),

@@ -11,13 +11,14 @@ import {
 } from "../message.js";
 import {
   answerTelegramCallbackQuery,
+  commitTelegramReply,
   deleteTelegramMessage,
   downloadTelegramFile,
   editTelegramMessageText,
   getTelegramUpdates,
+  sendTelegramChatAction,
   sendTelegramMessage,
   sendTelegramReply,
-  sendTelegramReplyWithMessages,
   type TelegramCallbackQuery,
   type TelegramInlineKeyboardMarkup,
   type TelegramMessage,
@@ -30,7 +31,8 @@ import {
 } from "../web/db.js";
 
 const MAX_HANDLED_UPDATE_IDS = 5000;
-const DECISION_TIMEOUT_MS = 3000;
+const CHAT_ACTION_REFRESH_MS = 4000;
+const DECISION_TIMEOUT_MS = 5000;
 const SUPPLEMENT_CONFIRM_MS = 1000;
 const SUPPLEMENT_STATUS_TEXT = "已按“补充当前任务”处理";
 const SUPPLEMENT_TIMEOUT_TEXT = "未选择，已默认按“补充当前任务”处理";
@@ -109,7 +111,7 @@ class CappedSet<T> {
 }
 
 class StatusMessageController {
-  private message: TelegramMessage | null = null;
+  private statusMessage: TelegramMessage | null = null;
 
   constructor(
     private readonly botToken: string,
@@ -118,7 +120,11 @@ class StatusMessageController {
   ) {}
 
   get messageId(): number | null {
-    return this.message?.message_id || null;
+    return this.statusMessage?.message_id || null;
+  }
+
+  get currentMessage(): TelegramMessage | null {
+    return this.statusMessage;
   }
 
   async show(
@@ -130,8 +136,8 @@ class StatusMessageController {
   ): Promise<void> {
     const replyMarkup = opts?.clearKeyboard ? { inline_keyboard: [] } : opts?.replyMarkup;
 
-    if (!this.message) {
-      this.message = await sendTelegramMessage(this.botToken, this.chatId, text, {
+    if (!this.statusMessage) {
+      this.statusMessage = await sendTelegramMessage(this.botToken, this.chatId, text, {
         replyToMessageId: this.replyToMessageId,
         replyMarkup,
       });
@@ -141,27 +147,27 @@ class StatusMessageController {
     await editTelegramMessageText(
       this.botToken,
       this.chatId,
-      this.message.message_id,
+      this.statusMessage.message_id,
       text,
       replyMarkup ? { replyMarkup } : undefined,
     );
   }
 
   async delete(): Promise<void> {
-    if (!this.message) {
+    if (!this.statusMessage) {
       return;
     }
 
     try {
-      await deleteTelegramMessage(this.botToken, this.chatId, this.message.message_id);
+      await deleteTelegramMessage(this.botToken, this.chatId, this.statusMessage.message_id);
     } catch (error) {
       logger.warn("telegram.status.delete_failed", {
         chatId: this.chatId,
-        messageId: this.message.message_id,
+        messageId: this.statusMessage.message_id,
         error,
       });
     } finally {
-      this.message = null;
+      this.statusMessage = null;
     }
   }
 }
@@ -357,6 +363,44 @@ function parseDecisionCallback(data?: string): { action: DecisionAction; decisio
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function startTypingIndicatorLoop(
+  botToken: string,
+  chatId: string,
+  isActive: () => boolean,
+): () => void {
+  let stopped = false;
+  let timer: NodeJS.Timeout | null = null;
+
+  const tick = () => {
+    if (stopped || !isActive()) {
+      return;
+    }
+
+    void sendTelegramChatAction(botToken, chatId, "typing").catch((error) => {
+      logger.warn("telegram.chat_action_failed", {
+        chatId,
+        action: "typing",
+        error,
+      });
+    }).finally(() => {
+      if (stopped || !isActive()) {
+        return;
+      }
+      timer = setTimeout(tick, CHAT_ACTION_REFRESH_MS);
+    });
+  };
+
+  tick();
+
+  return () => {
+    stopped = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
 }
 
 function isResetCommand(text: string): boolean {
@@ -777,6 +821,11 @@ export class TelegramChannel implements IChannel {
 
     const botToken = this.config!.botToken;
     const cleanupDirs = new Set<string>();
+    const stopTypingIndicator = startTypingIndicatorLoop(
+      botToken,
+      chatId,
+      () => state.running?.id === running.id && !running.abortController.signal.aborted,
+    );
 
     try {
       const prepared = await this.prepareBatchInput(botToken, running.batch, cleanupDirs);
@@ -807,20 +856,24 @@ export class TelegramChannel implements IChannel {
         return;
       }
 
+      stopTypingIndicator();
       await running.batch.status.show(SENDING_STATUS_TEXT);
-      const sentMessages = await sendTelegramReplyWithMessages(
+      const commitResult = await commitTelegramReply(
         botToken,
         chatId,
         reply,
         this.workdir,
+        { existingMessage: running.batch.status.currentMessage },
       );
 
       if (state.running?.id !== running.id) {
         return;
       }
 
-      persistTelegramAssistantReply(chatId, reply, sentMessages);
-      await running.batch.status.delete();
+      persistTelegramAssistantReply(chatId, reply, commitResult.messages);
+      if (!commitResult.reusedExistingMessage) {
+        await running.batch.status.delete();
+      }
     } catch (error) {
       if (running.abortController.signal.aborted) {
         logger.info("telegram.batch.aborted", {
@@ -838,6 +891,8 @@ export class TelegramChannel implements IChannel {
         }
       }
     } finally {
+      stopTypingIndicator();
+
       for (const cleanupDir of cleanupDirs) {
         await rm(cleanupDir, { recursive: true, force: true }).catch(() => {});
       }

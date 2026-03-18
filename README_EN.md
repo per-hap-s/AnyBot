@@ -121,7 +121,22 @@ WEB_PORT=19981
 LOG_LEVEL=info
 LOG_INCLUDE_CONTENT=false
 LOG_INCLUDE_PROMPT=false
+MEMORY_EXTRACTION_MODEL=gpt-5.4
+MEMORY_PROMOTION_MODEL=gpt-5.4
+SILICONFLOW_API_KEY=
+SILICONFLOW_EMBEDDING_MODEL=BAAI/bge-m3
+SILICONFLOW_EMBEDDING_URL=https://api.siliconflow.cn/v1/embeddings
+SILICONFLOW_EMBEDDING_TIMEOUT_MS=20000
 ```
+
+Memory notes:
+
+- Durable memory extraction runs asynchronously after a private-chat reply and defaults to `gpt-5.4`.
+- Canonical memory promotion also runs asynchronously and defaults to `gpt-5.4`.
+- New memory entries are embedded asynchronously through SiliconFlow with `BAAI/bge-m3`.
+- Memory indexing is currently limited to private chats (`web`, Feishu owner chat, Telegram owner chat).
+- Daily memory stays granular; duplicate merging is deferred to canonical-memory promotion.
+- Retrieval is enabled for canonical memory only; daily memory is not retrieved yet.
 
 ## Main API Routes
 

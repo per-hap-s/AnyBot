@@ -5,12 +5,7 @@ import { fileURLToPath } from "node:url";
 
 import { applyProxy } from "../proxy.js";
 import {
-  appendMemoryNote,
-  appendProfileNote,
-  buildMemoryCompactionPrompt,
   ensureAssistantFiles,
-  formatMemoryStatus,
-  getMemoryStatus,
 } from "../assistant-memory.js";
 import { createApp } from "../web/server.js";
 import {
@@ -34,7 +29,7 @@ import {
   getRegisteredChannelTypes,
   readChannelsConfig,
 } from "../channels/index.js";
-import type { ChannelCallbacks } from "../channels/index.js";
+import type { ChannelCallbacks, IChannel } from "../channels/index.js";
 import type { ProviderRuntimeEvent } from "../providers/index.js";
 import * as db from "../web/db.js";
 import {
@@ -47,6 +42,38 @@ import {
 } from "../shared.js";
 import { ensureControlToken } from "../control-token.js";
 import type { ServiceStatusPayload } from "../service-status.js";
+import {
+  appendDailyMemoryInvalidation,
+  appendDailyMemoryFact,
+  buildRelevantMemoryPromptSection,
+  createEmbedding,
+  enqueueMemoryJob,
+  enqueueAutomaticMemoryJobs,
+  enqueuePromotionJob,
+  extractDurableFacts,
+  getCanonicalMemoryById,
+  invalidateMemoryEntries,
+  listActiveCanonicalMemoriesByScope,
+  listMemoryEntriesByScope,
+  markCanonicalMemoryEmbedding,
+  MEMORY_CANONICAL_EMBED_JOB_KIND,
+  MEMORY_EMBED_JOB_KIND,
+  MEMORY_INVALIDATION_JOB_KIND,
+  MEMORY_JOB_KIND,
+  MEMORY_PROMOTION_JOB_KIND,
+  markMemoryEntryEmbedding,
+  MemoryWorker,
+  type MemoryScope,
+  OWNER_PRIVATE_MEMORY_SCOPE,
+  promoteCanonicalMemories,
+  recoverRunningMemoryJobs,
+  isMemoryQuestion,
+  retrieveRelevantCanonicalMemories,
+  resolveUnifiedPrivateMemoryScope,
+  saveExtractedFact,
+  selectMemoriesToInvalidate,
+  syncCanonicalMemories,
+} from "../memory/index.js";
 
 function getProviderConfig(): Record<string, unknown> {
   return {
@@ -113,6 +140,15 @@ function readAppVersion(): string {
   return "0.1.0";
 }
 
+function formatStartupTime(timestamp: number): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    dateStyle: "medium",
+    timeStyle: "medium",
+    hour12: false,
+    timeZone: "Asia/Shanghai",
+  }).format(timestamp);
+}
+
 export class AnyBotService {
   private readonly provider = initProvider(getProviderConfig());
   private readonly controlToken = ensureControlToken();
@@ -123,9 +159,20 @@ export class AnyBotService {
   private startedAt = Date.now();
   private webServer: Server | null = null;
   private shutdownPromise: Promise<void> | null = null;
+  private readonly memoryWorker = new MemoryWorker({
+    extract_memory: (payload) => this.runExtractMemoryJob(payload),
+    embed_memory_entry: (payload) => this.runEmbedMemoryJob(payload),
+    embed_canonical_memory: (payload) => this.runEmbedCanonicalMemoryJob(payload),
+    invalidate_memory: (payload) => this.runInvalidateMemoryJob(payload),
+    promote_memory_scope: (payload) => this.runPromoteMemoryScopeJob(payload),
+  });
 
   private buildConversationKey(source: string, chatId: string): string {
     return `${source}:${chatId}`;
+  }
+
+  private buildPrivateMemoryScopeForChat(source: string, chatId: string): MemoryScope | null {
+    return resolveUnifiedPrivateMemoryScope(source, chatId);
   }
 
   private getSessionGeneration(source: string, chatId: string): number {
@@ -190,9 +237,11 @@ export class AnyBotService {
     const dbSession = this.getOrCreateChannelSession(source, chatId);
     const sessionId = this.sessionIdByChat.get(conversationKey) || dbSession.sessionId || null;
     const sessionGeneration = this.getSessionGeneration(source, chatId);
+    const memoryScope = this.buildPrivateMemoryScopeForChat(source, chatId);
+    const memoryContext = await this.buildMemoryContextForReply(memoryScope, userText);
     const prompt = sessionId
-      ? buildResumePrompt(userText, source)
-      : buildFirstTurnPrompt(userText, source);
+      ? buildResumePrompt(userText, source, memoryContext)
+      : buildFirstTurnPrompt(userText, source, memoryContext);
 
     db.addMessage(dbSession.id, "user", userText);
 
@@ -251,7 +300,310 @@ export class AnyBotService {
       ...(shouldLogContent ? { replyText: rawLogString(result.text) } : {}),
     });
 
+    if (this.buildPrivateMemoryScopeForChat(source, chatId)) {
+      enqueueAutomaticMemoryJobs({
+        source,
+        chatId,
+        userText,
+        assistantText: result.text,
+      });
+    }
+
     return result.text;
+  }
+
+  private async buildMemoryContextForReply(
+    scope: MemoryScope | null,
+    userText: string,
+  ): Promise<string> {
+    if (!scope) {
+      return "";
+    }
+
+    try {
+      const hits = await retrieveRelevantCanonicalMemories(scope, userText);
+      logger.info("memory.retrieve.completed", {
+        scope,
+        queryChars: userText.length,
+        hitCount: hits.length,
+        hits: hits.map((hit) => ({
+          id: hit.id,
+          text: hit.text,
+          score: Number(hit.score.toFixed(4)),
+        })),
+      });
+      return buildRelevantMemoryPromptSection(hits, {
+        isMemoryQuestion: isMemoryQuestion(userText),
+      });
+    } catch (error) {
+      logger.warn("memory.retrieve.failed", {
+        scope,
+        error,
+      });
+      return "";
+    }
+  }
+
+  private async runExtractMemoryJob(payload: Record<string, unknown>): Promise<void> {
+    const source = typeof payload.source === "string" ? payload.source : "unknown";
+    const chatId = typeof payload.chatId === "string" ? payload.chatId : "";
+    const userText = typeof payload.userText === "string" ? payload.userText : "";
+    const assistantText = typeof payload.assistantText === "string" ? payload.assistantText : "";
+
+    if (!chatId || !userText || !assistantText) {
+      throw new Error("Invalid memory extraction payload");
+    }
+
+    const facts = await extractDurableFacts(this.provider, {
+      workdir: getWorkdir(),
+      sandbox: getSandbox(),
+      userText,
+      assistantText,
+    });
+
+    const scope = this.buildPrivateMemoryScopeForChat(source, chatId);
+    if (!scope) {
+      logger.info("memory.extract.skipped", {
+        source,
+        chatId,
+        reason: "non_private_chat",
+      });
+      return;
+    }
+    let insertedCount = 0;
+
+    for (const fact of facts) {
+      const saved = saveExtractedFact(scope, {
+        ...fact,
+        sourceRef: `${source}:${chatId}`,
+      });
+
+      const entry = db.getMemoryEntryById(saved.id);
+      if (entry && entry.status === "active" && entry.embeddingStatus !== "ready") {
+        enqueueMemoryJob(MEMORY_EMBED_JOB_KIND, saved.id, {
+          entryId: saved.id,
+        });
+      }
+
+      if (saved.inserted) {
+        appendDailyMemoryFact(getWorkdir(), scope, {
+          ...fact,
+          sourceRef: `${source}:${chatId}`,
+        });
+        insertedCount += 1;
+      }
+    }
+
+    logger.info("memory.extract.completed", {
+      source,
+      chatId,
+      factCount: facts.length,
+      insertedCount,
+    });
+
+    if (insertedCount > 0) {
+      enqueuePromotionJob(scope, `${Date.now()}:${insertedCount}`);
+    }
+  }
+
+  private async runEmbedMemoryJob(payload: Record<string, unknown>): Promise<void> {
+    const entryId = typeof payload.entryId === "string" ? payload.entryId : "";
+    if (!entryId) {
+      throw new Error("Invalid memory embedding payload");
+    }
+
+    const entry = db.getMemoryEntryById(entryId);
+    if (!entry) {
+      logger.info("memory.embed.skipped", {
+        entryId,
+        reason: "missing_entry",
+      });
+      return;
+    }
+
+    if (entry.status !== "active") {
+      logger.info("memory.embed.skipped", {
+        entryId,
+        reason: "inactive_entry",
+        status: entry.status,
+      });
+      return;
+    }
+
+    if (entry.embeddingStatus === "ready" && entry.embeddingModel && entry.embeddingJson) {
+      logger.info("memory.embed.skipped", {
+        entryId,
+        reason: "already_ready",
+        model: entry.embeddingModel,
+      });
+      return;
+    }
+
+    try {
+      const result = await createEmbedding(entry.text);
+      markMemoryEntryEmbedding(
+        entryId,
+        "ready",
+        result.model,
+        JSON.stringify(result.embedding),
+      );
+
+      logger.info("memory.embed.completed", {
+        entryId,
+        model: result.model,
+        dimensions: result.embedding.length,
+      });
+    } catch (error) {
+      markMemoryEntryEmbedding(entryId, "failed", null, null);
+      throw error;
+    }
+  }
+
+  private async runEmbedCanonicalMemoryJob(payload: Record<string, unknown>): Promise<void> {
+    const canonicalMemoryId = typeof payload.canonicalMemoryId === "string" ? payload.canonicalMemoryId : "";
+    if (!canonicalMemoryId) {
+      throw new Error("Invalid canonical memory embedding payload");
+    }
+
+    const entry = getCanonicalMemoryById(canonicalMemoryId);
+    if (!entry) {
+      logger.info("memory.canonical_embed.skipped", {
+        canonicalMemoryId,
+        reason: "missing_entry",
+      });
+      return;
+    }
+
+    if (entry.status !== "active") {
+      logger.info("memory.canonical_embed.skipped", {
+        canonicalMemoryId,
+        reason: "inactive_entry",
+        status: entry.status,
+      });
+      return;
+    }
+
+    if (entry.embeddingStatus === "ready" && entry.embeddingModel && entry.embeddingJson) {
+      logger.info("memory.canonical_embed.skipped", {
+        canonicalMemoryId,
+        reason: "already_ready",
+        model: entry.embeddingModel,
+      });
+      return;
+    }
+
+    try {
+      const result = await createEmbedding(entry.text);
+      markCanonicalMemoryEmbedding(
+        canonicalMemoryId,
+        "ready",
+        result.model,
+        JSON.stringify(result.embedding),
+      );
+
+      logger.info("memory.canonical_embed.completed", {
+        canonicalMemoryId,
+        model: result.model,
+        dimensions: result.embedding.length,
+      });
+    } catch (error) {
+      markCanonicalMemoryEmbedding(canonicalMemoryId, "failed", null, null);
+      throw error;
+    }
+  }
+
+  private async runInvalidateMemoryJob(payload: Record<string, unknown>): Promise<void> {
+    const source = typeof payload.source === "string" ? payload.source : "unknown";
+    const chatId = typeof payload.chatId === "string" ? payload.chatId : "";
+    const userText = typeof payload.userText === "string" ? payload.userText : "";
+
+    if (!chatId || !userText) {
+      throw new Error("Invalid memory invalidation payload");
+    }
+
+    const scope = this.buildPrivateMemoryScopeForChat(source, chatId);
+    if (!scope) {
+      logger.info("memory.invalidate.skipped", {
+        source,
+        chatId,
+        reason: "non_private_chat",
+      });
+      return;
+    }
+    const entries = listMemoryEntriesByScope(scope);
+    const decision = await selectMemoriesToInvalidate(this.provider, {
+      workdir: getWorkdir(),
+      sandbox: getSandbox(),
+      userText,
+      entries,
+    });
+
+    const changed = invalidateMemoryEntries(decision.targetIds);
+    if (changed > 0) {
+      appendDailyMemoryInvalidation(getWorkdir(), scope, userText);
+    }
+
+    logger.info("memory.invalidate.completed", {
+      source,
+      chatId,
+      candidateCount: entries.length,
+      targetCount: decision.targetIds.length,
+      changed,
+    });
+
+    if (changed > 0) {
+      enqueuePromotionJob(scope, `${Date.now()}:${changed}`);
+    }
+  }
+
+  private async runPromoteMemoryScopeJob(payload: Record<string, unknown>): Promise<void> {
+    const scope = typeof payload.scope === "string" ? payload.scope as MemoryScope : null;
+    if (!scope) {
+      throw new Error("Invalid memory promotion payload");
+    }
+
+    const dailyEntries = listMemoryEntriesByScope(scope);
+    const canonicalEntries = listActiveCanonicalMemoriesByScope(scope);
+
+    const candidates = await promoteCanonicalMemories(this.provider, {
+      workdir: getWorkdir(),
+      sandbox: getSandbox(),
+      dailyEntries,
+      canonicalEntries,
+    });
+
+    const result = syncCanonicalMemories(
+      scope,
+      candidates,
+      dailyEntries.map((entry) => ({
+        id: entry.id,
+        text: entry.text,
+        status: entry.status,
+      })),
+    );
+
+    logger.info("memory.promote.completed", {
+      scope,
+      dailyCount: dailyEntries.length,
+      canonicalCandidateCount: candidates.length,
+      activeCount: result.activeCount,
+      upsertedCount: result.upsertedCount,
+      supersededCount: result.supersededCount,
+    });
+
+    this.enqueueCanonicalEmbeddingBackfill(scope);
+  }
+
+  private enqueueCanonicalEmbeddingBackfill(scope: MemoryScope): void {
+    for (const entry of listActiveCanonicalMemoriesByScope(scope)) {
+      if (entry.embeddingStatus === "ready" && entry.embeddingModel && entry.embeddingJson) {
+        continue;
+      }
+
+      enqueueMemoryJob(MEMORY_CANONICAL_EMBED_JOB_KIND, entry.id, {
+        canonicalMemoryId: entry.id,
+      });
+    }
   }
 
   private listModels() {
@@ -276,48 +628,74 @@ export class AnyBotService {
   }
 
   private getMemoryStatusSummary(): string {
-    return formatMemoryStatus(getMemoryStatus(getWorkdir()));
+    const entries = db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE);
+    const activeCount = entries.filter((entry) => entry.status === "active").length;
+    const rejectedCount = entries.filter((entry) => entry.status === "rejected").length;
+    const readyCount = entries.filter((entry) => entry.embeddingStatus === "ready").length;
+    const canonicalCount = db.listCanonicalMemoriesByScope(OWNER_PRIVATE_MEMORY_SCOPE)
+      .filter((entry) => entry.status === "active")
+      .length;
+    return [
+      "Memory status:",
+      `- Scope: ${OWNER_PRIVATE_MEMORY_SCOPE}`,
+      `- Active: ${activeCount}`,
+      `- Rejected: ${rejectedCount}`,
+      `- Canonical: ${canonicalCount}`,
+      `- Embedding ready: ${readyCount}`,
+      "- Source of truth: structured memory store",
+      "- MEMORY.md / PROFILE.md: legacy compatibility only",
+    ].join("\n");
   }
 
-  private async rememberMemory(text: string): Promise<{ success: boolean; message: string }> {
-    const result = appendMemoryNote(text, getWorkdir());
-    return {
-      success: result.changed,
-      message: result.changed ? `Saved to MEMORY.md: ${text}` : result.message,
-    };
-  }
-
-  private async updateProfile(text: string): Promise<{ success: boolean; message: string }> {
-    const result = appendProfileNote(text, getWorkdir());
-    return {
-      success: result.changed,
-      message: result.changed ? `Saved to PROFILE.md: ${text}` : result.message,
-    };
-  }
-
-  private async compressMemory(): Promise<{ success: boolean; message: string }> {
-    const before = getMemoryStatus(getWorkdir());
-    if (!before.needsCompaction) {
-      return {
-        success: false,
-        message: `MEMORY.md is ${before.memoryBytes} bytes, below the ${before.compactThresholdBytes} byte threshold.`,
-      };
-    }
-
-    const result = await this.provider.run({
-      workdir: getWorkdir(),
-      sandbox: getSandbox(),
-      model: getCurrentModel(),
-      prompt: buildMemoryCompactionPrompt(before),
+  private upsertManualMemory(
+    text: string,
+    sourceRef: string,
+  ): { success: boolean; message: string } {
+    const saved = saveExtractedFact(OWNER_PRIVATE_MEMORY_SCOPE, {
+      text: text.trim(),
+      confidence: 1,
+      durability: "long_term_candidate",
+      sourceType: "long_term_memory",
+      sourceRef,
+      lastConfirmedAt: Date.now(),
     });
 
-    const after = getMemoryStatus(getWorkdir());
-    const delta = before.memoryBytes - after.memoryBytes;
-    const deltaText = delta > 0 ? ` Reduced by ${delta} bytes.` : "";
+    appendDailyMemoryFact(getWorkdir(), OWNER_PRIVATE_MEMORY_SCOPE, {
+      text: text.trim(),
+      confidence: 1,
+      durability: "long_term_candidate",
+      sourceType: "long_term_memory",
+      sourceRef,
+      lastConfirmedAt: Date.now(),
+    });
+
+    const entry = db.getMemoryEntryById(saved.id);
+    if (entry && entry.status === "active" && entry.embeddingStatus !== "ready") {
+      enqueueMemoryJob(MEMORY_EMBED_JOB_KIND, saved.id, {
+        entryId: saved.id,
+      });
+    }
+
+    enqueuePromotionJob(OWNER_PRIVATE_MEMORY_SCOPE, `${Date.now()}:${saved.id}`);
 
     return {
       success: true,
-      message: `Compacted MEMORY.md. It is now ${after.memoryBytes} bytes.${deltaText}\n\n${result.text}`,
+      message: saved.inserted ? `Saved to structured memory: ${text}` : "That memory is already captured.",
+    };
+  }
+
+  private async rememberMemory(text: string): Promise<{ success: boolean; message: string }> {
+    return this.upsertManualMemory(text, "manual:remember");
+  }
+
+  private async updateProfile(text: string): Promise<{ success: boolean; message: string }> {
+    return this.upsertManualMemory(text, "manual:profile");
+  }
+
+  private async compressMemory(): Promise<{ success: boolean; message: string }> {
+    return {
+      success: false,
+      message: "Legacy MEMORY.md compaction is deprecated. Structured memory does not use /compress-memory.",
     };
   }
 
@@ -343,6 +721,37 @@ export class AnyBotService {
     };
   }
 
+  private buildStartupNotification(channels: IChannel[]): string {
+    const activeChannels = channels.map((channel) => channel.type).join(", ") || "none";
+    return [
+      "AnyBot 已上线。",
+      `时间：${formatStartupTime(this.startedAt)}`,
+      `模型：${getCurrentModel()}`,
+      `通道：${activeChannels}`,
+    ].join("\n");
+  }
+
+  private async notifyOwnersServiceStarted(channels: IChannel[]): Promise<void> {
+    if (channels.length === 0) {
+      return;
+    }
+
+    const message = this.buildStartupNotification(channels);
+    await Promise.all(channels.map(async (channel) => {
+      try {
+        await channel.sendToOwner(message);
+        logger.info("service.owner_notified_startup", {
+          channel: channel.type,
+        });
+      } catch (error) {
+        logger.warn("service.owner_notify_startup_failed", {
+          channel: channel.type,
+          error,
+        });
+      }
+    }));
+  }
+
   async start(): Promise<void> {
     ensureAssistantFiles(getWorkdir());
 
@@ -364,6 +773,17 @@ export class AnyBotService {
     });
 
     this.hydrateChannelSessions();
+    const recoveredJobs = recoverRunningMemoryJobs();
+    if (recoveredJobs > 0) {
+      logger.warn("memory.jobs.recovered_running", {
+        count: recoveredJobs,
+      });
+    }
+    this.memoryWorker.start();
+    if (db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE).length > 0) {
+      enqueuePromotionJob(OWNER_PRIVATE_MEMORY_SCOPE, `startup:${this.startedAt}`);
+    }
+    this.enqueueCanonicalEmbeddingBackfill(OWNER_PRIVATE_MEMORY_SCOPE);
 
     const channelCallbacks: ChannelCallbacks = {
       generateReply: (chatId, userText, imagePaths, source, onEvent, signal) =>
@@ -401,6 +821,7 @@ export class AnyBotService {
     logger.info("service.started", {
       activeChannels: channels.map((c) => c.type),
     });
+    await this.notifyOwnersServiceStarted(channels);
   }
 
   async shutdown(reason: string): Promise<void> {
@@ -412,6 +833,7 @@ export class AnyBotService {
       logger.info("service.stopping", { reason });
 
       await channelManager.stopAll();
+      await this.memoryWorker.stop();
 
       if (this.webServer) {
         await new Promise<void>((resolve) => {

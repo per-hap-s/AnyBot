@@ -129,6 +129,11 @@ interface TelegramFileInfo {
 type TelegramReplyMarkup = TelegramInlineKeyboardMarkup;
 type TelegramEditedMessage = TelegramMessage | true;
 
+export interface TelegramReplyCommitResult {
+  messages: TelegramMessage[];
+  reusedExistingMessage: boolean;
+}
+
 function buildMethodUrl(botToken: string, method: string): string {
   return `${TELEGRAM_API_BASE}/bot${botToken}/${method}`;
 }
@@ -541,25 +546,7 @@ export async function sendTelegramReply(
   reply: string,
   workdir: string,
 ): Promise<void> {
-  const payload = parseReplyPayload(reply, workdir);
-
-  if (payload.text) {
-    await sendTelegramMessage(botToken, chatId, payload.text, { clearDraft: true });
-  } else if (payload.imagePaths.length > 0 || payload.filePaths.length > 0) {
-    await sendTelegramMessage(botToken, chatId, "请查收~", { clearDraft: true });
-  }
-
-  for (const imagePath of payload.imagePaths) {
-    await sendTelegramPhoto(botToken, chatId, imagePath, { clearDraft: true });
-  }
-
-  for (const filePath of payload.filePaths) {
-    await sendTelegramDocument(botToken, chatId, filePath, { clearDraft: true });
-  }
-
-  if (!payload.text && payload.imagePaths.length === 0 && payload.filePaths.length === 0) {
-    await sendTelegramMessage(botToken, chatId, reply, { clearDraft: true });
-  }
+  await commitTelegramReply(botToken, chatId, reply, workdir);
 }
 
 export async function sendTelegramReplyWithMessages(
@@ -568,8 +555,47 @@ export async function sendTelegramReplyWithMessages(
   reply: string,
   workdir: string,
 ): Promise<TelegramMessage[]> {
+  const result = await commitTelegramReply(botToken, chatId, reply, workdir);
+  return result.messages;
+}
+
+export async function commitTelegramReply(
+  botToken: string,
+  chatId: string | number,
+  reply: string,
+  workdir: string,
+  opts?: {
+    existingMessage?: TelegramMessage | null;
+  },
+): Promise<TelegramReplyCommitResult> {
   const payload = parseReplyPayload(reply, workdir);
   const sentMessages: TelegramMessage[] = [];
+  const isPureText = Boolean(payload.text)
+    && payload.imagePaths.length === 0
+    && payload.filePaths.length === 0;
+
+  if (isPureText && opts?.existingMessage) {
+    const edited = await sendTelegramEditMessageText(
+      botToken,
+      opts.existingMessage.chat.id,
+      opts.existingMessage.message_id,
+      payload.text,
+    );
+    const editedMessage = edited === true
+      ? {
+          ...opts.existingMessage,
+          text: payload.text,
+          caption: undefined,
+          photo: undefined,
+          document: undefined,
+        }
+      : edited;
+
+    return {
+      messages: [editedMessage],
+      reusedExistingMessage: true,
+    };
+  }
 
   if (payload.text) {
     sentMessages.push(
@@ -599,5 +625,8 @@ export async function sendTelegramReplyWithMessages(
     );
   }
 
-  return sentMessages;
+  return {
+    messages: sentMessages,
+    reusedExistingMessage: false,
+  };
 }
