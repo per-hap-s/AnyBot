@@ -6,6 +6,11 @@ export type ImageMessageContent = {
   image_key?: string;
 };
 
+export type FileMessageContent = {
+  file_key?: string;
+  file_name?: string;
+};
+
 export type IncomingMessage = {
   message_id: string;
   chat_id: string;

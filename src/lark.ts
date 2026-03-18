@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { IncomingMessage } from "./types.js";
-import { parseIncomingImageKey, getImageExtension, parseReplyPayload } from "./message.js";
+import {
+  parseIncomingImageKey,
+  getImageExtension,
+  parseReplyPayload,
+  parseIncomingFileInfo,
+  sanitizeIncomingFileName,
+} from "./message.js";
 import { includeContentInLogs, logger, rawLogString } from "./logger.js";
 
 const shouldLogContent = includeContentInLogs();
@@ -410,4 +416,47 @@ export async function downloadImageFromMessage(
     contentType: Array.isArray(contentType) ? contentType[0] : contentType,
   });
   return filePath;
+}
+
+export async function downloadFileFromMessage(
+  client: Lark.Client,
+  message: IncomingMessage,
+): Promise<{ filePath: string; fileName: string }> {
+  const fileInfo = parseIncomingFileInfo(message.content);
+  if (!fileInfo) {
+    throw new Error(`无法解析文件消息内容：${message.content}`);
+  }
+
+  const safeFileName = sanitizeIncomingFileName(fileInfo.fileName);
+  logger.info("lark.download_file.start", {
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    fileKey: fileInfo.fileKey,
+    fileName: safeFileName,
+  });
+
+  const response = await client.im.messageResource.get({
+    path: {
+      message_id: message.message_id,
+      file_key: fileInfo.fileKey,
+    },
+    params: { type: "file" },
+  });
+
+  const tempDir = await mkdtemp(path.join(tmpdir(), "codex-feishu-file-"));
+  const filePath = path.join(tempDir, safeFileName);
+  await response.writeFile(filePath);
+
+  logger.info("lark.download_file.success", {
+    messageId: message.message_id,
+    chatId: message.chat_id,
+    fileKey: fileInfo.fileKey,
+    fileName: safeFileName,
+    filePath,
+  });
+
+  return {
+    filePath,
+    fileName: safeFileName,
+  };
 }

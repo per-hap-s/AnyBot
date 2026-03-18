@@ -1,11 +1,14 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
-import type { ChannelsConfig, FeishuChannelConfig, QQBotChannelConfig, TelegramChannelConfig } from "./types.js";
+import type {
+  ChannelsConfig,
+  FeishuChannelConfig,
+  TelegramChannelConfig,
+} from "./types.js";
+import { getDataDir } from "../runtime-paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.resolve(__dirname, "../../.data/channels.json");
+const CONFIG_PATH = path.join(getDataDir(), "channels.json");
 
 const DEFAULT_CONFIG: ChannelsConfig = {
   feishu: {
@@ -17,16 +20,13 @@ const DEFAULT_CONFIG: ChannelsConfig = {
     ackReaction: "OK",
     ownerChatId: "",
   } satisfies FeishuChannelConfig,
-  qqbot: {
-    enabled: false,
-    appId: "",
-    appSecret: "",
-    ownerChatId: "",
-  } satisfies QQBotChannelConfig,
   telegram: {
     enabled: false,
-    token: "",
     ownerChatId: "",
+    botToken: "",
+    privateOnly: true,
+    allowGroups: false,
+    pollingTimeoutSeconds: 30,
   } satisfies TelegramChannelConfig,
 };
 
@@ -43,7 +43,54 @@ function ensureConfig(): void {
 export function readChannelsConfig(): ChannelsConfig {
   ensureConfig();
   const raw = readFileSync(CONFIG_PATH, "utf-8");
-  return JSON.parse(raw) as ChannelsConfig;
+  const parsed = JSON.parse(raw) as Partial<ChannelsConfig>;
+  const feishu = (parsed.feishu ?? {}) as Partial<FeishuChannelConfig>;
+  const telegram = (parsed.telegram ?? {}) as Partial<TelegramChannelConfig>;
+
+  return {
+    feishu: {
+      enabled: typeof feishu.enabled === "boolean"
+        ? feishu.enabled
+        : DEFAULT_CONFIG.feishu!.enabled,
+      appId: typeof feishu.appId === "string" ? feishu.appId : DEFAULT_CONFIG.feishu!.appId,
+      appSecret: typeof feishu.appSecret === "string"
+        ? feishu.appSecret
+        : DEFAULT_CONFIG.feishu!.appSecret,
+      groupChatMode: feishu.groupChatMode === "all" ? "all" : DEFAULT_CONFIG.feishu!.groupChatMode,
+      botOpenId: typeof feishu.botOpenId === "string"
+        ? feishu.botOpenId
+        : DEFAULT_CONFIG.feishu!.botOpenId,
+      ackReaction: typeof feishu.ackReaction === "string"
+        ? feishu.ackReaction
+        : DEFAULT_CONFIG.feishu!.ackReaction,
+      ownerChatId: typeof feishu.ownerChatId === "string"
+        ? feishu.ownerChatId
+        : DEFAULT_CONFIG.feishu!.ownerChatId,
+    } satisfies FeishuChannelConfig,
+    telegram: {
+      enabled: typeof telegram.enabled === "boolean"
+        ? telegram.enabled
+        : DEFAULT_CONFIG.telegram!.enabled,
+      ownerChatId: typeof telegram.ownerChatId === "string"
+        ? telegram.ownerChatId
+        : DEFAULT_CONFIG.telegram!.ownerChatId,
+      botToken: typeof telegram.botToken === "string"
+        ? telegram.botToken
+        : DEFAULT_CONFIG.telegram!.botToken,
+      privateOnly: typeof telegram.privateOnly === "boolean"
+        ? telegram.privateOnly
+        : DEFAULT_CONFIG.telegram!.privateOnly,
+      allowGroups: typeof telegram.allowGroups === "boolean"
+        ? telegram.allowGroups
+        : DEFAULT_CONFIG.telegram!.allowGroups,
+      pollingTimeoutSeconds:
+        typeof telegram.pollingTimeoutSeconds === "number" &&
+        Number.isFinite(telegram.pollingTimeoutSeconds) &&
+        telegram.pollingTimeoutSeconds > 0
+          ? Math.min(Math.max(Math.round(telegram.pollingTimeoutSeconds), 1), 50)
+          : DEFAULT_CONFIG.telegram!.pollingTimeoutSeconds,
+    } satisfies TelegramChannelConfig,
+  };
 }
 
 export function readChannelConfig<T extends ChannelsConfig[string]>(
@@ -62,8 +109,36 @@ export function updateChannelConfig(
   channelType: string,
   partial: Partial<ChannelsConfig[string]>,
 ): ChannelsConfig {
-  const config = readChannelsConfig();
-  config[channelType] = { ...config[channelType], ...partial } as ChannelsConfig[string];
-  writeChannelsConfig(config);
-  return config;
+  if (channelType !== "feishu" && channelType !== "telegram") {
+    throw new Error(`Unsupported channel type: ${channelType}`);
+  }
+
+  const current = readChannelsConfig();
+  const nextConfig: ChannelsConfig = {
+    feishu: {
+      ...DEFAULT_CONFIG.feishu,
+      ...(current.feishu ?? {}),
+    } as FeishuChannelConfig,
+    telegram: {
+      ...DEFAULT_CONFIG.telegram,
+      ...(current.telegram ?? {}),
+    } as TelegramChannelConfig,
+  };
+
+  if (channelType === "feishu") {
+    nextConfig.feishu = {
+      ...DEFAULT_CONFIG.feishu,
+      ...(current.feishu ?? {}),
+      ...(partial ?? {}),
+    } as FeishuChannelConfig;
+  }
+  if (channelType === "telegram") {
+    nextConfig.telegram = {
+      ...DEFAULT_CONFIG.telegram,
+      ...(current.telegram ?? {}),
+      ...(partial ?? {}),
+    } as TelegramChannelConfig;
+  }
+  writeChannelsConfig(nextConfig);
+  return nextConfig;
 }

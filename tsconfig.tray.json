@@ -1,0 +1,7 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist/tray"
+  },
+  "include": ["src/tray/**/*.ts", "src/control-token.ts", "src/runtime-paths.ts", "src/service-status.ts"]
+}

@@ -1,0 +1,19 @@
+
+> anybot@0.1.0 start
+> tsx src/index.ts
+
+AnyBot 界面： http://localhost:19981
+[info]: [ 'client ready' ]
+[info]: [ 'event-dispatch is ready' ]
+[info]: [
+  '[ws]',
+  'receive events or callbacks through persistent connection only available in self-build & Feishu app, Configured in:\n' +
+    '        Developer Console(开发者后台) \n' +
+    '          ->\n' +
+    '        Events and Callbacks(事件与回调)\n' +
+    '          -> \n' +
+    '        Mode of event/callback subscription(订阅方式)\n' +
+    '          -> \n' +
+    '        Receive events/callbacks through persistent connection(使用 长连接 接收事件/回调)'
+]
+[info]: [ '[ws]', 'ws client ready' ]

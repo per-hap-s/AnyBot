@@ -3,23 +3,25 @@ import multer from "multer";
 import path from "node:path";
 import fs from "node:fs";
 import type { Request, Response } from "express";
-import { getProvider, getRegisteredProviderTypes } from "../providers/index.js";
+import {
+  getProvider,
+  ProviderAbortedError,
+  type ProviderRuntimeEvent,
+} from "../providers/index.js";
 import { logger } from "../logger.js";
 import * as db from "./db.js";
 import {
   readModelConfig,
   getCurrentModel,
   setCurrentModel,
-  setCurrentProvider,
   getProviderTypes,
 } from "./model-config.js";
 import {
   readChannelsConfig,
   updateChannelConfig,
-  getRegisteredChannelTypes,
   channelManager,
+  getRegisteredChannelTypes,
 } from "../channels/index.js";
-import { listSkills, toggleSkill, deleteSkill, openSkillsFolder } from "./skills.js";
 import { readProxyConfig, writeProxyConfig, getProxyUrl, type ProxyConfig } from "./proxy-config.js";
 import { applyProxy } from "../proxy.js";
 import { ProxyAgent, fetch as undiciFetch } from "undici";
@@ -31,46 +33,204 @@ import {
   getWorkdir,
   getSandbox,
 } from "../shared.js";
+import { CONTROL_TOKEN_HEADER } from "../control-token.js";
+import type { ServiceStatusPayload } from "../service-status.js";
 
-// 图片扩展名集合
-const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".ico", ".tiff", ".tif", ".heic", ".heif", ".avif"]);
+const IMAGE_EXTS = new Set([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".bmp",
+  ".webp",
+  ".svg",
+  ".ico",
+  ".tiff",
+  ".tif",
+  ".heic",
+  ".heif",
+  ".avif",
+]);
 
 function isImageFile(filePath: string): boolean {
   return IMAGE_EXTS.has(path.extname(filePath).toLowerCase());
 }
 
-// 上传目录：使用配置的工作目录
 const UPLOAD_DIR = path.join(getWorkdir(), "tmp", "uploads");
-try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (_) {}
+try {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+} catch {
+  // ignore
+}
 
-// multer 配置：保留原始扩展名
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
-    // 每次上传时确保目录存在（防止运行中被删除）
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
     cb(null, UPLOAD_DIR);
   },
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname);
-    const base = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_\-\u4e00-\u9fff]/g, "_");
+    const base = path
+      .basename(file.originalname, ext)
+      .replace(/[^a-zA-Z0-9_\-\u4e00-\u9fff]/g, "_");
     const unique = `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     cb(null, `${base}-${unique}${ext}`);
   },
 });
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } }); // 50MB 上限
 
-export function chatRouter(): Router {
+const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+
+export interface ApiRouterOptions {
+  getStatus: () => ServiceStatusPayload;
+  requestShutdown: () => void;
+  controlToken: string;
+}
+
+type AttachmentPayload = { path: string; name: string };
+
+type PreparedMessageInput = {
+  content: string;
+  userText: string;
+  imagePaths: string[];
+  filePaths: AttachmentPayload[];
+  metadata: string | null;
+};
+
+type StreamEvent =
+  | { type: "started"; sessionId: string; title: string }
+  | { type: "status"; phase: "preparing" | "running" | "finalizing"; message: string }
+  | { type: "provider"; eventType: string; threadId?: string }
+  | { type: "assistant"; content: string; title: string }
+  | { type: "done"; title: string }
+  | { type: "error"; error: string };
+
+function isLoopbackAddress(value?: string): boolean {
+  if (!value) return false;
+  return (
+    value === "127.0.0.1" ||
+    value === "::1" ||
+    value === "::ffff:127.0.0.1" ||
+    value === "::ffff:7f00:1"
+  );
+}
+
+function prepareMessageInput(
+  content?: string,
+  attachments?: AttachmentPayload[],
+): PreparedMessageInput {
+  let userText = (content || "").trim();
+  const imagePaths: string[] = [];
+  const filePaths: AttachmentPayload[] = [];
+
+  if (attachments && attachments.length > 0) {
+    for (const att of attachments) {
+      if (isImageFile(att.name)) {
+        imagePaths.push(att.path);
+      } else {
+        filePaths.push(att);
+      }
+    }
+
+    if (filePaths.length > 0) {
+      const fileList = filePaths.map((file) => `- ${file.name}: ${file.path}`).join("\n");
+      userText = `${userText}\n\nAttached files:\n${fileList}`;
+    }
+
+    if (imagePaths.length > 0) {
+      const imageList = imagePaths.map((filePath) => `- ${path.basename(filePath)}: ${filePath}`).join("\n");
+      userText = `${userText}\n\nAttached images:\n${imageList}`;
+    }
+  }
+
+  const attachmentNames = (attachments || []).map((attachment) => attachment.name);
+  const metadata = attachmentNames.length > 0
+    ? JSON.stringify({ attachments: attachmentNames })
+    : null;
+
+  return {
+    content: content?.trim() || "",
+    userText,
+    imagePaths,
+    filePaths,
+    metadata,
+  };
+}
+
+function persistUserMessage(
+  session: db.ChatSession,
+  prepared: PreparedMessageInput,
+): void {
+  db.addMessage(session.id, "user", prepared.content || "[attachment]", prepared.metadata);
+
+  if (session.messages.length <= 1) {
+    session.title = generateTitle(prepared.content || "Attachment");
+  }
+}
+
+function buildSessionPrompt(session: db.ChatSession, userText: string): string {
+  return session.sessionId
+    ? buildResumePrompt(userText)
+    : buildFirstTurnPrompt(userText);
+}
+
+function startNdjsonStream(res: Response): void {
+  res.status(200);
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+}
+
+function writeStreamEvent(res: Response, event: StreamEvent): void {
+  if (res.writableEnded || res.destroyed) {
+    return;
+  }
+  res.write(`${JSON.stringify(event)}\n`);
+}
+
+function endStream(res: Response): void {
+  if (!res.writableEnded) {
+    res.end();
+  }
+}
+
+export function chatRouter(options: ApiRouterOptions): Router {
   const router = Router();
 
+  router.get("/status", (_req: Request, res: Response) => {
+    res.json(options.getStatus());
+  });
+
+  router.post("/control/shutdown", (req: Request, res: Response) => {
+    const remoteAddress = req.socket.remoteAddress || req.ip;
+    const tokenHeader = req.headers[CONTROL_TOKEN_HEADER];
+    const token = Array.isArray(tokenHeader) ? tokenHeader[0] : tokenHeader;
+
+    if (!isLoopbackAddress(remoteAddress)) {
+      res.status(403).json({ error: "Shutdown is only allowed from localhost" });
+      return;
+    }
+
+    if (token !== options.controlToken) {
+      res.status(403).json({ error: "Invalid control token" });
+      return;
+    }
+
+    res.json({ ok: true });
+    setImmediate(() => {
+      options.requestShutdown();
+    });
+  });
+
   router.get("/sessions", (_req: Request, res: Response) => {
-    const list = db.listSessions();
-    res.json(list);
+    res.json(db.listSessions());
   });
 
   router.post("/sessions", (_req: Request, res: Response) => {
     const session: db.ChatSession = {
       id: generateId(),
-      title: "新对话",
+      title: "New Chat",
       sessionId: null,
       source: "web",
       chatId: null,
@@ -86,7 +246,7 @@ export function chatRouter(): Router {
     const id = req.params.id as string;
     const session = db.getSession(id);
     if (!session) {
-      res.status(404).json({ error: "会话不存在" });
+      res.status(404).json({ error: "Session not found" });
       return;
     }
     res.json({
@@ -102,77 +262,52 @@ export function chatRouter(): Router {
     res.json({ ok: true });
   });
 
-  // --- Model & Provider config ---
-
   router.get("/model-config", (_req: Request, res: Response) => {
     try {
-      res.json(readModelConfig());
-    } catch (error) {
-      res.status(500).json({ error: "读取模型配置失败" });
+      res.json({
+        ...readModelConfig(),
+        providers: getProviderTypes(),
+      });
+    } catch {
+      res.status(500).json({ error: "Failed to read model config" });
     }
   });
 
   router.put("/model-config", (req: Request, res: Response) => {
     const { modelId } = req.body as { modelId?: string };
     if (!modelId) {
-      res.status(400).json({ error: "缺少 modelId" });
+      res.status(400).json({ error: "Missing modelId" });
       return;
     }
+
     try {
       const config = setCurrentModel(modelId);
       logger.info("model.switched", { modelId });
       res.json(config);
     } catch (error) {
-      const msg = error instanceof Error ? error.message : "切换模型失败";
-      res.status(400).json({ error: msg });
+      const message = error instanceof Error ? error.message : "Failed to switch model";
+      res.status(400).json({ error: message });
     }
   });
-
-  router.get("/providers", (_req: Request, res: Response) => {
-    try {
-      const providers = getProviderTypes();
-      const current = getProvider().type;
-      res.json({ current, providers });
-    } catch (error) {
-      res.status(500).json({ error: "读取 Provider 列表失败" });
-    }
-  });
-
-  router.put("/providers/current", (req: Request, res: Response) => {
-    const { provider } = req.body as { provider?: string };
-    if (!provider) {
-      res.status(400).json({ error: "缺少 provider" });
-      return;
-    }
-    try {
-      const config = setCurrentProvider(provider);
-      logger.info("provider.switched", { provider });
-      res.json(config);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : "切换 Provider 失败";
-      res.status(400).json({ error: msg });
-    }
-  });
-
-  // --- Channels ---
 
   router.get("/channels", (_req: Request, res: Response) => {
     try {
-      const config = readChannelsConfig();
-      const registered = getRegisteredChannelTypes();
-      res.json({ registered, config });
-    } catch (error) {
-      res.status(500).json({ error: "读取频道配置失败" });
+      res.json({
+        registered: getRegisteredChannelTypes(),
+        config: readChannelsConfig(),
+      });
+    } catch {
+      res.status(500).json({ error: "Failed to read channel config" });
     }
   });
 
   router.put("/channels/:type", (req: Request, res: Response) => {
     const channelType = req.params.type as string;
-    const registered = getRegisteredChannelTypes();
-    if (!registered.includes(channelType)) {
-      res.status(400).json({ error: `不支持的频道类型: ${channelType}` });
+    if (!getRegisteredChannelTypes().includes(channelType)) {
+      res.status(400).json({ error: `Unsupported channel type: ${channelType}` });
       return;
     }
+
     try {
       const config = updateChannelConfig(channelType, req.body);
       logger.info("channel.config.updated", { channelType });
@@ -182,65 +317,16 @@ export function chatRouter(): Router {
         logger.error("channel.restart_after_save_failed", { channelType, error });
       });
     } catch (error) {
-      const msg = error instanceof Error ? error.message : "更新频道配置失败";
-      res.status(400).json({ error: msg });
+      const message = error instanceof Error ? error.message : "Failed to update channel config";
+      res.status(400).json({ error: message });
     }
   });
-
-  // --- Skills ---
-
-  router.get("/skills", (_req: Request, res: Response) => {
-    try {
-      res.json(listSkills());
-    } catch (error) {
-      res.status(500).json({ error: "读取技能列表失败" });
-    }
-  });
-
-  router.put("/skills/:id/toggle", (req: Request, res: Response) => {
-    const id = decodeURIComponent(req.params.id as string);
-    const { enabled } = req.body as { enabled?: boolean };
-    if (typeof enabled !== "boolean") {
-      res.status(400).json({ error: "缺少 enabled 参数" });
-      return;
-    }
-    try {
-      toggleSkill(id, enabled);
-      logger.info("skill.toggled", { id, enabled });
-      res.json({ ok: true });
-    } catch (error) {
-      res.status(500).json({ error: "切换技能状态失败" });
-    }
-  });
-
-  router.delete("/skills/:id", (req: Request, res: Response) => {
-    const id = decodeURIComponent(req.params.id as string);
-    const result = deleteSkill(id);
-    if (!result.ok) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-    logger.info("skill.deleted", { id });
-    res.json({ ok: true });
-  });
-
-  router.post("/skills/open-folder", (req: Request, res: Response) => {
-    try {
-      const skillPath = req.body?.path as string | undefined;
-      openSkillsFolder(skillPath);
-      res.json({ ok: true });
-    } catch (error) {
-      res.status(500).json({ error: "打开文件夹失败" });
-    }
-  });
-
-  // --- Proxy ---
 
   router.get("/proxy", (_req: Request, res: Response) => {
     try {
       res.json(readProxyConfig());
-    } catch (error) {
-      res.status(500).json({ error: "读取代理配置失败" });
+    } catch {
+      res.status(500).json({ error: "Failed to read proxy config" });
     }
   });
 
@@ -266,8 +352,8 @@ export function chatRouter(): Router {
       });
       res.json(config);
     } catch (error) {
-      const msg = error instanceof Error ? error.message : "更新代理配置失败";
-      res.status(400).json({ error: msg });
+      const message = error instanceof Error ? error.message : "Failed to update proxy config";
+      res.status(400).json({ error: message });
     }
   });
 
@@ -277,40 +363,41 @@ export function chatRouter(): Router {
       enabled: true,
       protocol: body?.protocol === "socks5" ? "socks5" : "http",
       host: (typeof body?.host === "string" && body.host.trim()) || "127.0.0.1",
-      port: (typeof body?.port === "number" && body.port > 0) ? body.port : 7890,
+      port: typeof body?.port === "number" && body.port > 0 ? body.port : 7890,
     };
+
     if (body?.username) testConfig.username = body.username;
     if (body?.password) testConfig.password = body.password;
 
     const proxyUrl = getProxyUrl(testConfig);
     if (!proxyUrl) {
-      res.json({ ok: false, error: "代理地址无效" });
+      res.json({ ok: false, error: "Invalid proxy config" });
       return;
     }
 
     let agent: ProxyAgent | null = null;
     try {
       agent = new ProxyAgent(proxyUrl);
-      const testUrl = "https://www.google.com/generate_204";
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 8000);
-      const start = Date.now();
-      const response = await undiciFetch(testUrl, {
+      const startedAt = Date.now();
+      const response = await undiciFetch("https://www.google.com/generate_204", {
         dispatcher: agent,
         signal: controller.signal,
       });
       clearTimeout(timeout);
-      const latency = Date.now() - start;
-      res.json({ ok: response.ok || response.status === 204, latency, status: response.status });
+      res.json({
+        ok: response.ok || response.status === 204,
+        latency: Date.now() - startedAt,
+        status: response.status,
+      });
     } catch (error) {
-      const msg = error instanceof Error ? error.message : "连接失败";
-      res.json({ ok: false, error: msg });
+      const message = error instanceof Error ? error.message : "Connection failed";
+      res.json({ ok: false, error: message });
     } finally {
       agent?.close();
     }
   });
-
-  // --- Send message to owner via channel bot ---
 
   router.post("/send", async (req: Request, res: Response) => {
     const { channel, message } = req.body as {
@@ -318,27 +405,18 @@ export function chatRouter(): Router {
       message?: string;
     };
 
-    if (!channel) {
-      res.status(400).json({ error: "缺少 channel 参数（feishu / telegram / qqbot）" });
+    if (!channel || !getRegisteredChannelTypes().includes(channel)) {
+      res.status(400).json({ error: "Unsupported channel" });
       return;
     }
     if (!message?.trim()) {
-      res.status(400).json({ error: "缺少 message 参数" });
-      return;
-    }
-
-    const registered = getRegisteredChannelTypes();
-    if (!registered.includes(channel)) {
-      res.status(400).json({ error: `不支持的频道类型: ${channel}，可选: ${registered.join(", ")}` });
+      res.status(400).json({ error: "Missing message" });
       return;
     }
 
     const ch = channelManager.getChannel(channel);
     if (!ch) {
-      const running = channelManager.getRunningChannelTypes();
-      res.status(400).json({
-        error: `频道 ${channel} 未启动，当前运行中: ${running.length ? running.join(", ") : "无"}`,
-      });
+      res.status(400).json({ error: `${channel} channel is not running` });
       return;
     }
 
@@ -348,21 +426,24 @@ export function chatRouter(): Router {
       res.json({ ok: true });
     } catch (error) {
       logger.error("api.send.failed", { channel, error });
-      const msg = error instanceof Error ? error.message : "发送消息失败";
-      res.status(500).json({ error: msg });
+      const responseMessage = error instanceof Error ? error.message : "Failed to send message";
+      res.status(500).json({ error: responseMessage });
     }
   });
 
-  // --- 文件上传 ---
-
   router.post("/upload", upload.single("file"), (req: Request, res: Response) => {
-    const file = (req as any).file as Express.Multer.File | undefined;
+    const file = (req as Request & { file?: Express.Multer.File }).file;
     if (!file) {
-      res.status(400).json({ error: "未收到文件" });
+      res.status(400).json({ error: "No file uploaded" });
       return;
     }
+
     const absPath = path.resolve(file.path);
-    logger.info("web.upload.success", { name: file.originalname, path: absPath, size: file.size });
+    logger.info("web.upload.success", {
+      name: file.originalname,
+      path: absPath,
+      size: file.size,
+    });
     res.json({
       path: absPath,
       name: file.originalname,
@@ -371,63 +452,26 @@ export function chatRouter(): Router {
     });
   });
 
-  // --- Chat messages ---
-
   router.post("/sessions/:id/messages", async (req: Request, res: Response) => {
     const id = req.params.id as string;
     const session = db.getSession(id);
     if (!session) {
-      res.status(404).json({ error: "会话不存在" });
+      res.status(404).json({ error: "Session not found" });
       return;
     }
 
     const { content, attachments } = req.body as {
       content?: string;
-      attachments?: { path: string; name: string }[];
+      attachments?: AttachmentPayload[];
     };
     if (!content?.trim() && (!attachments || attachments.length === 0)) {
-      res.status(400).json({ error: "消息不能为空" });
+      res.status(400).json({ error: "Message cannot be empty" });
       return;
     }
 
-    // 构建包含附件信息的用户文本
-    let userText = (content || "").trim();
-    const imagePaths: string[] = [];
-    const filePaths: { path: string; name: string }[] = [];
-
-    if (attachments && attachments.length > 0) {
-      for (const att of attachments) {
-        if (isImageFile(att.name)) {
-          imagePaths.push(att.path);
-        } else {
-          filePaths.push(att);
-        }
-      }
-      // 非图片文件信息拼接到 prompt
-      if (filePaths.length > 0) {
-        const fileList = filePaths.map(f => `- ${f.name}: ${f.path}`).join("\n");
-        userText = `${userText}\n\n用户附带了以下文件，请读取并处理：\n${fileList}`;
-      }
-      // 图片文件也补充提示
-      if (imagePaths.length > 0) {
-        const imgList = imagePaths.map(p => `- ${path.basename(p)}: ${p}`).join("\n");
-        userText = `${userText}\n\n用户附带了以下图片：\n${imgList}`;
-      }
-    }
-
-    // 构建 metadata（附件名称列表）
-    const attachmentNames = (attachments || []).map(a => a.name);
-    const metadata = attachmentNames.length > 0 ? JSON.stringify({ attachments: attachmentNames }) : null;
-
-    db.addMessage(id, "user", content?.trim() || "[附件]", metadata);
-
-    if (session.messages.length <= 1) {
-      session.title = generateTitle(content?.trim() || "文件分析");
-    }
-
-    const prompt = session.sessionId
-      ? buildResumePrompt(userText)
-      : buildFirstTurnPrompt(userText);
+    const prepared = prepareMessageInput(content, attachments);
+    persistUserMessage(session, prepared);
+    const prompt = buildSessionPrompt(session, prepared.userText);
 
     try {
       const provider = getProvider();
@@ -435,9 +479,9 @@ export function chatRouter(): Router {
         sessionId: session.id,
         providerSessionId: session.sessionId,
         provider: provider.type,
-        userTextChars: userText.length,
-        imageCount: imagePaths.length,
-        fileCount: filePaths.length,
+        userTextChars: prepared.userText.length,
+        imageCount: prepared.imagePaths.length,
+        fileCount: prepared.filePaths.length,
       });
 
       const result = await provider.run({
@@ -445,7 +489,7 @@ export function chatRouter(): Router {
         sandbox: getSandbox(),
         model: getCurrentModel(),
         prompt,
-        imagePaths: imagePaths.length > 0 ? imagePaths : undefined,
+        imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
         sessionId: session.sessionId || undefined,
       });
 
@@ -476,9 +520,151 @@ export function chatRouter(): Router {
         error,
       });
 
-      const errorMessage =
-        error instanceof Error ? error.message : "处理消息时出错了，请稍后再试。";
-      res.status(500).json({ error: errorMessage });
+      const message = error instanceof Error ? error.message : "Failed to handle message";
+      res.status(500).json({ error: message });
+    }
+  });
+
+  router.post("/sessions/:id/messages/stream", async (req: Request, res: Response) => {
+    const id = req.params.id as string;
+    const session = db.getSession(id);
+    if (!session) {
+      res.status(404).json({ error: "Session not found" });
+      return;
+    }
+
+    const { content, attachments } = req.body as {
+      content?: string;
+      attachments?: AttachmentPayload[];
+    };
+    if (!content?.trim() && (!attachments || attachments.length === 0)) {
+      res.status(400).json({ error: "Message cannot be empty" });
+      return;
+    }
+
+    const prepared = prepareMessageInput(content, attachments);
+    persistUserMessage(session, prepared);
+    const prompt = buildSessionPrompt(session, prepared.userText);
+    const provider = getProvider();
+    const abortController = new AbortController();
+    let completed = false;
+
+    const abortStream = () => {
+      if (!completed && !res.writableEnded) {
+        abortController.abort();
+      }
+    };
+
+    req.on("aborted", abortStream);
+    res.on("close", abortStream);
+
+    startNdjsonStream(res);
+    writeStreamEvent(res, {
+      type: "started",
+      sessionId: session.id,
+      title: session.title,
+    });
+    writeStreamEvent(res, {
+      type: "status",
+      phase: "preparing",
+      message: "正在连接 Codex...",
+    });
+
+    try {
+      logger.info("web.chat.stream.start", {
+        sessionId: session.id,
+        providerSessionId: session.sessionId,
+        provider: provider.type,
+        userTextChars: prepared.userText.length,
+        imageCount: prepared.imagePaths.length,
+        fileCount: prepared.filePaths.length,
+      });
+
+      const result = await provider.run({
+        workdir: getWorkdir(),
+        sandbox: getSandbox(),
+        model: getCurrentModel(),
+        prompt,
+        imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
+        sessionId: session.sessionId || undefined,
+        signal: abortController.signal,
+        onEvent: (event: ProviderRuntimeEvent) => {
+          if (event.type === "thread.started") {
+            writeStreamEvent(res, {
+              type: "provider",
+              eventType: event.type,
+              threadId: event.threadId,
+            });
+            writeStreamEvent(res, {
+              type: "status",
+              phase: "running",
+              message: "Codex 会话已建立，正在生成回复...",
+            });
+            return;
+          }
+
+          if (event.type === "turn.started") {
+            writeStreamEvent(res, {
+              type: "status",
+              phase: "running",
+              message: "正在生成回复...",
+            });
+            return;
+          }
+
+          if (event.type === "item.completed" && event.itemType === "agent_message") {
+            writeStreamEvent(res, {
+              type: "status",
+              phase: "finalizing",
+              message: "正在整理最终回复...",
+            });
+          }
+        },
+      });
+
+      const providerSessionId = result.sessionId || session.sessionId;
+      db.addMessage(id, "assistant", result.text);
+      db.updateSession({
+        id,
+        title: session.title,
+        sessionId: providerSessionId,
+        updatedAt: Date.now(),
+      });
+
+      logger.info("web.chat.stream.success", {
+        sessionId: session.id,
+        providerSessionId,
+        provider: provider.type,
+        replyChars: result.text.length,
+      });
+
+      writeStreamEvent(res, {
+        type: "assistant",
+        content: result.text,
+        title: session.title,
+      });
+      writeStreamEvent(res, {
+        type: "done",
+        title: session.title,
+      });
+      completed = true;
+      endStream(res);
+    } catch (error) {
+      if (error instanceof ProviderAbortedError && abortController.signal.aborted) {
+        completed = true;
+        endStream(res);
+        return;
+      }
+
+      logger.error("web.chat.stream.failed", {
+        sessionId: session.id,
+        error,
+      });
+
+      const message = error instanceof Error ? error.message : "Failed to handle message";
+      writeStreamEvent(res, { type: "error", error: message });
+      completed = true;
+      endStream(res);
     }
   });
 

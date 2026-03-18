@@ -5,13 +5,14 @@ import type {
   RunResult,
   ProviderModel,
   ProviderCapabilities,
+  ProviderRuntimeEvent,
 } from "./types.js";
 import type { CodexJsonEvent } from "../types.js";
 import { logger } from "../logger.js";
 
 export class ProviderTimeoutError extends Error {
   constructor(timeoutMs: number) {
-    super(`Provider 执行超时（${Math.round(timeoutMs / 1000)}s）`);
+    super(`Provider execution timed out after ${Math.round(timeoutMs / 1000)}s`);
     this.name = "ProviderTimeoutError";
   }
 }
@@ -20,14 +21,14 @@ export class ProviderProcessError extends Error {
   constructor(exitCode: number | null, output: string) {
     const code = exitCode ?? "unknown";
     const preview = output.slice(0, 300);
-    super(`Provider 进程异常退出（状态码 ${code}）：${preview}`);
+    super(`Provider exited with code ${code}: ${preview}`);
     this.name = "ProviderProcessError";
   }
 }
 
 export class ProviderEmptyOutputError extends Error {
   constructor() {
-    super("Provider 返回了空内容");
+    super("Provider returned empty output");
     this.name = "ProviderEmptyOutputError";
   }
 }
@@ -35,8 +36,15 @@ export class ProviderEmptyOutputError extends Error {
 export class ProviderParseError extends Error {
   constructor(stdout: string) {
     const preview = stdout.slice(0, 300);
-    super(`无法从 Provider 输出中解析有效消息：${preview}`);
+    super(`Failed to parse provider output: ${preview}`);
     this.name = "ProviderParseError";
+  }
+}
+
+export class ProviderAbortedError extends Error {
+  constructor() {
+    super("Provider execution was aborted");
+    this.name = "ProviderAbortedError";
   }
 }
 
@@ -59,9 +67,9 @@ export class CodexProvider implements IProvider {
 
   listModels(): ProviderModel[] {
     return [
-      { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", description: "默认编程模型" },
-      { id: "gpt-5.4", name: "GPT-5.4", description: "最新通用模型" },
-      { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", description: "稳定编程模型" },
+      { id: "gpt-5.4", name: "GPT-5.4", description: "Latest general model" },
+      { id: "gpt-5.3-codex", name: "GPT-5.3 Codex", description: "Default coding model" },
+      { id: "gpt-5.2-codex", name: "GPT-5.2 Codex", description: "Stable coding model" },
     ];
   }
 
@@ -73,20 +81,21 @@ export class CodexProvider implements IProvider {
       imagePaths = [],
       sessionId,
       timeoutMs = DEFAULT_TIMEOUT_MS,
+      signal,
+      onEvent,
     } = opts;
     const sandbox = opts.sandbox ?? process.env.CODEX_SANDBOX ?? "read-only";
     const startedAt = Date.now();
+    const canUseDetachedGroup = process.platform !== "win32";
 
     const args: string[] = sessionId
       ? ["exec", "resume", "--json", "--skip-git-repo-check"]
       : ["exec", "--json", "--skip-git-repo-check", "-C", workdir, "-s", sandbox];
 
-    // resume 模式不支持 -s，需要用其他方式传递沙箱权限
     if (sessionId) {
       if (sandbox === "danger-full-access") {
         args.push("--dangerously-bypass-approvals-and-sandbox");
       } else if (sandbox === "workspace-write") {
-        // --full-auto 等价于 --sandbox workspace-write
         args.push("--full-auto");
       }
     }
@@ -121,32 +130,101 @@ export class CodexProvider implements IProvider {
         cwd: workdir,
         env: process.env,
         stdio: ["pipe", "pipe", "pipe"],
-        detached: true,
+        detached: canUseDetachedGroup,
       });
 
       let stdout = "";
       let stderr = "";
+      let stdoutBuffer = "";
       let killed = false;
+      let aborted = false;
       let startedThreadId: string | null = null;
+      let lastMessage: string | null = null;
 
-      const killProcessGroup = (signal: NodeJS.Signals) => {
+      const emitEvent = (event: ProviderRuntimeEvent) => {
         try {
-          if (child.pid) process.kill(-child.pid, signal);
-        } catch {
+          onEvent?.(event);
+        } catch (error) {
+          logger.warn("provider.exec.event_handler_failed", {
+            provider: this.type,
+            error,
+          });
+        }
+      };
+
+      const terminateChild = (signal: NodeJS.Signals) => {
+        if (canUseDetachedGroup && child.pid) {
+          try {
+            process.kill(-child.pid, signal);
+            return;
+          } catch {
+            // fallback below
+          }
+        }
+
+        try {
           child.kill(signal);
+        } catch {
+          // ignore
+        }
+      };
+
+      const handleStdoutLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          return;
+        }
+
+        try {
+          const event = JSON.parse(trimmed) as CodexJsonEvent;
+          if (event.type === "thread.started" && event.thread_id) {
+            startedThreadId = event.thread_id;
+          }
+
+          if (
+            event.type === "item.completed" &&
+            event.item?.type === "agent_message" &&
+            event.item.text?.trim()
+          ) {
+            lastMessage = event.item.text.trim();
+          }
+
+          emitEvent({
+            type: event.type || "unknown",
+            threadId: event.thread_id,
+            itemType: event.item?.type,
+            text: event.item?.text,
+          });
+        } catch {
+          // Ignore non-JSON stdout lines.
+        }
+      };
+
+      const flushStdoutBuffer = () => {
+        let newlineIndex = stdoutBuffer.indexOf("\n");
+        while (newlineIndex >= 0) {
+          const line = stdoutBuffer.slice(0, newlineIndex);
+          stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+          handleStdoutLine(line);
+          newlineIndex = stdoutBuffer.indexOf("\n");
         }
       };
 
       const timer = setTimeout(() => {
         killed = true;
-        killProcessGroup("SIGTERM");
+        terminateChild("SIGTERM");
         setTimeout(() => {
-          if (!child.killed) killProcessGroup("SIGKILL");
+          if (!child.killed) {
+            terminateChild("SIGKILL");
+          }
         }, 3000);
       }, timeoutMs);
 
       child.stdout.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString("utf8");
+        const text = chunk.toString("utf8");
+        stdout += text;
+        stdoutBuffer += text;
+        flushStdoutBuffer();
       });
 
       child.stderr.on("data", (chunk: Buffer) => {
@@ -156,8 +234,22 @@ export class CodexProvider implements IProvider {
       child.stdin.write(prompt);
       child.stdin.end();
 
+      const abortHandler = () => {
+        aborted = true;
+        terminateChild("SIGTERM");
+      };
+
+      if (signal) {
+        if (signal.aborted) {
+          abortHandler();
+        } else {
+          signal.addEventListener("abort", abortHandler, { once: true });
+        }
+      }
+
       child.on("error", (error) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", abortHandler);
         logger.error("provider.exec.spawn_error", {
           provider: this.type,
           workdir,
@@ -165,11 +257,26 @@ export class CodexProvider implements IProvider {
           durationMs: Date.now() - startedAt,
           error,
         });
+
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          reject(
+            new Error(
+              "Failed to start Codex CLI. Set CODEX_BIN to the full executable path if it is not available in PATH.",
+            ),
+          );
+          return;
+        }
+
         reject(error);
       });
 
       child.on("close", (code) => {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", abortHandler);
+        if (stdoutBuffer.trim()) {
+          handleStdoutLine(stdoutBuffer);
+          stdoutBuffer = "";
+        }
 
         if (killed) {
           logger.warn("provider.exec.timeout", {
@@ -181,6 +288,17 @@ export class CodexProvider implements IProvider {
             stderrChars: stderr.length,
           });
           reject(new ProviderTimeoutError(timeoutMs));
+          return;
+        }
+
+        if (aborted) {
+          logger.info("provider.exec.aborted", {
+            provider: this.type,
+            workdir,
+            sandbox,
+            durationMs: Date.now() - startedAt,
+          });
+          reject(new ProviderAbortedError());
           return;
         }
 
@@ -200,34 +318,6 @@ export class CodexProvider implements IProvider {
           return;
         }
 
-        const lines = stdout
-          .split("\n")
-          .map((line) => line.trim())
-          .filter(Boolean);
-
-        const messages = lines
-          .map((line) => {
-            try {
-              const event = JSON.parse(line) as CodexJsonEvent;
-              if (event.type === "thread.started" && event.thread_id) {
-                startedThreadId = event.thread_id;
-              }
-              return event;
-            } catch {
-              return null;
-            }
-          })
-          .filter((event): event is CodexJsonEvent => Boolean(event))
-          .filter(
-            (event) =>
-              event.type === "item.completed" &&
-              event.item?.type === "agent_message" &&
-              Boolean(event.item.text),
-          )
-          .map((event) => event.item?.text?.trim() || "")
-          .filter(Boolean);
-
-        const lastMessage = messages.at(-1);
         if (!lastMessage) {
           logger.error("provider.exec.parse_error", {
             provider: this.type,
@@ -248,7 +338,6 @@ export class CodexProvider implements IProvider {
           durationMs: Date.now() - startedAt,
           stdoutChars: stdout.length,
           stderrChars: stderr.length,
-          messageCount: messages.length,
           replyChars: lastMessage.length,
           sessionId: startedThreadId || sessionId || null,
         });

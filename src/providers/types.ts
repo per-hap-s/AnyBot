@@ -14,6 +14,8 @@ export interface RunOptions {
   sessionId?: string;
   sandbox?: SandboxMode;
   timeoutMs?: number;
+  signal?: AbortSignal;
+  onEvent?: (event: ProviderRuntimeEvent) => void;
 }
 
 export interface RunResult {
@@ -25,6 +27,13 @@ export interface ProviderCapabilities {
   sessionResume: boolean;
   imageInput: boolean;
   sandbox: boolean;
+}
+
+export interface ProviderRuntimeEvent {
+  type: string;
+  threadId?: string;
+  itemType?: string;
+  text?: string;
 }
 
 export interface ProviderConfig {

@@ -3,14 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "main": "dist/tray/tray/main.js",
   "scripts": {
-    "setup": "sh ./setup.sh",
-    "dev": "tsx watch src/index.ts",
+    "dev": "npm run dev:tray",
+    "dev:service": "tsx watch src/index.ts",
+    "dev:tray": "npm run build:tray && node scripts/launch-tray.mjs",
     "start": "tsx src/index.ts",
-    "check": "tsc --noEmit",
-    "bot:start": "mkdir -p .run && sh ./scripts/bot-start.sh",
-    "bot:stop": "sh ./scripts/bot-stop.sh",
-    "bot:status": "sh ./scripts/bot-status.sh"
+    "start:tray": "npm run build && node scripts/launch-tray.mjs",
+    "build:service": "tsc -p tsconfig.service.json && node scripts/copy-web-assets.mjs",
+    "build:tray": "tsc -p tsconfig.tray.json",
+    "build:tray-icons": "python scripts/generate_tray_icons.py",
+    "build": "npm run build:service && npm run build:tray",
+    "check": "tsc -p tsconfig.service.json --noEmit && tsc -p tsconfig.tray.json --noEmit",
+    "pack:win": "npm run build && electron-builder --win nsis",
+    "postinstall": "electron-builder install-app-deps"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.59.0",
@@ -26,7 +32,32 @@
     "@types/multer": "^2.1.0",
     "@types/node": "^24.3.1",
     "@types/ws": "^8.18.1",
+    "electron": "^36.2.1",
+    "electron-builder": "^25.1.8",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
+  },
+  "build": {
+    "appId": "com.anybot.tray",
+    "productName": "AnyBot",
+    "directories": {
+      "output": "release"
+    },
+    "asarUnpack": [
+      "node_modules/better-sqlite3/**/*"
+    ],
+    "files": [
+      "dist/**/*",
+      "assets/icons/**/*",
+      "package.json",
+      "node_modules/**/*"
+    ],
+    "win": {
+      "icon": "assets/icons/app.ico",
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    }
   }
 }

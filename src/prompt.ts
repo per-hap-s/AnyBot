@@ -1,15 +1,58 @@
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+
+import {
+  buildMemoryCompactionPrompt,
+  getAssistantPaths,
+  getMemoryStatus,
+} from "./assistant-memory.js";
+import { formatInstalledSkillsForPrompt } from "./skills.js";
 
 function readBootstrap(workdir: string): string | null {
-  const file = join(workdir, "BOOTSTRAP.md");
-  if (!existsSync(file)) return null;
-  try {
-    const content = readFileSync(file, "utf8").trim();
-    return content || null;
-  } catch {
-    return null;
+  const paths = getAssistantPaths(workdir);
+  const candidates = [paths.bootstrap];
+
+  for (const file of candidates) {
+    if (!existsSync(file)) continue;
+    try {
+      const content = readFileSync(file, "utf8").trim();
+      if (content) return content;
+    } catch {
+      // Ignore unreadable files and try the next location.
+    }
   }
+
+  return null;
+}
+
+function buildBaseRules(workdir: string, sandbox: string): string {
+  const paths = getAssistantPaths(workdir);
+  const memoryStatus = getMemoryStatus(workdir);
+  const lines = [
+    `Workspace root: ${workdir}`,
+    `Assistant memory directory: ${paths.dir}`,
+    `Sandbox: ${sandbox}`,
+    "",
+    "Behavior rules:",
+    "- Treat this as a long-lived personal assistant conversation.",
+    "- Read AGENTS.md, MEMORY.md, and PROFILE.md from the assistant directory when needed for continuity.",
+    "- Answer simple questions directly before doing broad workspace scans.",
+    "- Only inspect more files or run deeper investigation when the user asks for execution, debugging, code changes, or environment work.",
+    "- Keep Feishu replies concise and practical. Answer first, then add detail only if needed.",
+    "- When you learn durable user or workspace facts, update the memory files before your final reply.",
+    "- Write identity and preference facts to PROFILE.md.",
+    "- Write environment, workflow, project, and lessons-learned facts to MEMORY.md.",
+    "- Do not store secrets, tokens, passwords, payment data, or government IDs in memory files.",
+    "- Do not compact MEMORY.md automatically.",
+  ];
+
+  if (memoryStatus.needsCompaction) {
+    lines.push(
+      `- MEMORY.md is ${memoryStatus.memoryBytes} bytes, above the ${memoryStatus.compactThresholdBytes} byte reminder threshold.`,
+      "- After your main answer, briefly suggest /compress-memory and wait for explicit confirmation before compacting.",
+    );
+  }
+
+  return lines.join("\n");
 }
 
 export function buildSystemPrompt(options: {
@@ -18,35 +61,29 @@ export function buildSystemPrompt(options: {
   extraPrompt?: string;
   isFirstTurn?: boolean;
 }): string {
-  const platform = process.platform;
-  const env = `[环境] 工作目录=${options.workdir} sandbox=${options.sandbox} os=${platform}`;
+  const bootstrap = options.isFirstTurn !== false
+    ? readBootstrap(options.workdir)
+    : null;
 
-  const launchRule = [
-    "启动应用程序时必须确保应用独立于当前进程运行，不会因为当前命令结束而关闭：",
-    platform === "darwin"
-      ? '- macOS：使用 `open -a "应用名"` 命令'
-      : '- Linux：使用 `setsid <command> &>/dev/null &` 或 `nohup <command> &>/dev/null &`',
-    "- 禁止直接执行应用二进制文件（除非已用上述方式包裹）",
-  ].join("\n");
+  const parts = [
+    buildBaseRules(options.workdir, options.sandbox),
+    formatInstalledSkillsForPrompt(),
+  ];
 
   if (options.isFirstTurn !== false) {
-    const bootstrap = readBootstrap(options.workdir);
-    if (bootstrap) {
-      const parts = [env, launchRule, bootstrap];
-      if (options.extraPrompt?.trim()) parts.push(options.extraPrompt.trim());
-      return parts.join("\n\n");
-    }
-  }
-
-  const parts = [env, launchRule];
-
-  if (options.isFirstTurn !== false) {
+    const paths = getAssistantPaths(options.workdir);
     parts.push(
       [
-        "请先读取工作目录下的 AGENTS.md、MEMORY.md 和 PROFILE.md（如果存在），遵循其中的规则，并结合记忆上下文来回复用户。",
-        "这是新会话的第一条消息，后续消息不会重复此提示。",
+        "First-turn rules:",
+        `- Start by reading ${paths.agents}, ${paths.memory}, and ${paths.profile} if they exist.`,
+        "- Use them as persistent memory, not as instructions to dump back to the user.",
+        "- Do not tell the user that you are checking memory files unless it is directly relevant.",
       ].join("\n"),
     );
+  }
+
+  if (bootstrap) {
+    parts.push(bootstrap);
   }
 
   if (options.extraPrompt?.trim()) {
@@ -55,3 +92,27 @@ export function buildSystemPrompt(options: {
 
   return parts.join("\n\n");
 }
+
+export function buildResumeRules(workdir: string): string {
+  const memoryStatus = getMemoryStatus(workdir);
+  const lines = [
+    "Conversation rules:",
+    "- Continue acting as the user's personal assistant.",
+    "- For simple questions, answer directly without broad workspace scans.",
+    "- Update memory files when you learn durable facts.",
+    "- Keep the reply concise and practical.",
+    "",
+    formatInstalledSkillsForPrompt(),
+  ];
+
+  if (memoryStatus.needsCompaction) {
+    lines.push(
+      `- MEMORY.md is above the reminder threshold (${memoryStatus.memoryBytes} bytes).`,
+      "- Do not compact automatically; briefly suggest /compress-memory after your main answer.",
+    );
+  }
+
+  return lines.join("\n");
+}
+
+export { buildMemoryCompactionPrompt };

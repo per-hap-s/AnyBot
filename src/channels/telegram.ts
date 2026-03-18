@@ -1,64 +1,367 @@
-import { mkdtemp, writeFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { rm } from "node:fs/promises";
 import path from "node:path";
 
-import type { TelegramChannelConfig, IChannel, ChannelCallbacks } from "./types.js";
+import type { IChannel, ChannelCallbacks, TelegramChannelConfig } from "./types.js";
 import { readChannelConfig, updateChannelConfig } from "./config.js";
-import { sanitizeUserText } from "../message.js";
-import { includeContentInLogs, logger, rawLogString } from "../logger.js";
+import { logger } from "../logger.js";
 import { handleCommand } from "./commands.js";
+import {
+  isSupportedFeishuDocumentFileName,
+  buildUnsupportedFeishuFileMessage,
+} from "../message.js";
+import {
+  answerTelegramCallbackQuery,
+  deleteTelegramMessage,
+  downloadTelegramFile,
+  editTelegramMessageText,
+  getTelegramUpdates,
+  sendTelegramMessage,
+  sendTelegramReply,
+  sendTelegramReplyWithMessages,
+  type TelegramCallbackQuery,
+  type TelegramInlineKeyboardMarkup,
+  type TelegramMessage,
+  type TelegramUpdate,
+} from "../telegram.js";
+import type { ProviderRuntimeEvent } from "../providers/index.js";
+import {
+  findTelegramMessageRef,
+  saveTelegramMessageRef,
+} from "../web/db.js";
 
-const shouldLogContent = includeContentInLogs();
+const MAX_HANDLED_UPDATE_IDS = 5000;
+const DECISION_TIMEOUT_MS = 3000;
+const SUPPLEMENT_CONFIRM_MS = 1000;
+const SUPPLEMENT_STATUS_TEXT = "已按“补充当前任务”处理";
+const SUPPLEMENT_TIMEOUT_TEXT = "未选择，已默认按“补充当前任务”处理";
+const SUPPLEMENT_RUNNING_TEXT = "正在重新整理你的问题…";
+const QUEUED_STATUS_TEXT = "排队中…";
+const RUNNING_STATUS_TEXT = "正在理解你的问题…";
+const FINALIZING_STATUS_TEXT = "正在整理回答…";
+const SENDING_STATUS_TEXT = "正在发送回复…";
+const STALE_DECISION_TEXT = "该选项已失效";
+const CALLBACK_PREFIX = "tgd";
 
-const TELEGRAM_API = "https://api.telegram.org";
-const POLL_TIMEOUT_SECS = 30;
-const POLL_FETCH_TIMEOUT_MS = (POLL_TIMEOUT_SECS + 15) * 1000;
-const MAX_HANDLED_IDS = 5000;
-const TG_MAX_MESSAGE_LENGTH = 4096;
+type PendingKind = "text" | "photo" | "document";
+type DecisionAction = "supplement" | "queue";
+
+interface PendingItem {
+  kind: PendingKind;
+  message: TelegramMessage;
+}
+
+interface PendingBatch {
+  id: string;
+  items: PendingItem[];
+  status: StatusMessageController;
+}
+
+interface RunningTask {
+  id: string;
+  batch: PendingBatch;
+  abortController: AbortController;
+  generation: number;
+}
+
+interface PendingDecision {
+  id: string;
+  batch: PendingBatch;
+  timer: NodeJS.Timeout | null;
+}
+
+interface PendingRestart {
+  batch: PendingBatch;
+  earliestStartAt: number;
+  combinedItemCount: number;
+}
+
+interface ChatState {
+  running: RunningTask | null;
+  decision: PendingDecision | null;
+  queued: PendingBatch[];
+  pendingRestart: PendingRestart | null;
+  generation: number;
+}
 
 class CappedSet<T> {
   private set = new Set<T>();
   private queue: T[] = [];
-  constructor(private capacity: number) {}
+
+  constructor(private readonly capacity: number) {}
 
   has(value: T): boolean {
     return this.set.has(value);
   }
 
   add(value: T): void {
-    if (this.set.has(value)) return;
+    if (this.set.has(value)) {
+      return;
+    }
     if (this.set.size >= this.capacity) {
-      const oldest = this.queue.shift()!;
-      this.set.delete(oldest);
+      const oldest = this.queue.shift();
+      if (oldest !== undefined) {
+        this.set.delete(oldest);
+      }
     }
     this.set.add(value);
     this.queue.push(value);
   }
 }
 
-interface TelegramUpdate {
-  update_id: number;
-  message?: TelegramMessage;
+class StatusMessageController {
+  private message: TelegramMessage | null = null;
+
+  constructor(
+    private readonly botToken: string,
+    private readonly chatId: number,
+    private readonly replyToMessageId: number,
+  ) {}
+
+  get messageId(): number | null {
+    return this.message?.message_id || null;
+  }
+
+  async show(
+    text: string,
+    opts?: {
+      replyMarkup?: TelegramInlineKeyboardMarkup;
+      clearKeyboard?: boolean;
+    },
+  ): Promise<void> {
+    const replyMarkup = opts?.clearKeyboard ? { inline_keyboard: [] } : opts?.replyMarkup;
+
+    if (!this.message) {
+      this.message = await sendTelegramMessage(this.botToken, this.chatId, text, {
+        replyToMessageId: this.replyToMessageId,
+        replyMarkup,
+      });
+      return;
+    }
+
+    await editTelegramMessageText(
+      this.botToken,
+      this.chatId,
+      this.message.message_id,
+      text,
+      replyMarkup ? { replyMarkup } : undefined,
+    );
+  }
+
+  async delete(): Promise<void> {
+    if (!this.message) {
+      return;
+    }
+
+    try {
+      await deleteTelegramMessage(this.botToken, this.chatId, this.message.message_id);
+    } catch (error) {
+      logger.warn("telegram.status.delete_failed", {
+        chatId: this.chatId,
+        messageId: this.message.message_id,
+        error,
+      });
+    } finally {
+      this.message = null;
+    }
+  }
 }
 
-interface TelegramMessage {
-  message_id: number;
-  chat: { id: number; type: string };
-  from?: { id: number; is_bot: boolean; username?: string };
-  text?: string;
-  photo?: TelegramPhotoSize[];
-  caption?: string;
-  entities?: Array<{ type: string; offset: number; length: number }>;
-  new_chat_members?: unknown[];
-  left_chat_member?: unknown;
+function isPrivateMessage(message: TelegramMessage): boolean {
+  return message.chat.type === "private";
 }
 
-interface TelegramPhotoSize {
-  file_id: string;
-  file_unique_id: string;
-  width: number;
-  height: number;
-  file_size?: number;
+function getMessageText(message: Pick<TelegramMessage, "text" | "caption">): string {
+  return (message.text || message.caption || "").trim();
+}
+
+function truncateTelegramContext(text: string, maxLength: number = 1200): string {
+  const normalized = text.replace(/\r\n/g, "\n").trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+  return `${normalized.slice(0, maxLength - 1)}...`;
+}
+
+function describeTelegramMedia(
+  message: Pick<TelegramMessage, "text" | "caption" | "photo" | "document">,
+): string {
+  const text = getMessageText(message);
+  if (text) {
+    return text;
+  }
+  if (message.document?.file_name) {
+    return `[Document] ${message.document.file_name}`;
+  }
+  if (message.document) {
+    return "[Document]";
+  }
+  if (message.photo?.length) {
+    return "[Photo]";
+  }
+  return "[Unsupported Telegram message]";
+}
+
+function getTelegramMessageRole(
+  message?: { from?: TelegramMessage["from"] } | null,
+): "user" | "assistant" | "unknown" {
+  if (!message?.from) {
+    return "unknown";
+  }
+  return message.from.is_bot ? "assistant" : "user";
+}
+
+function buildTelegramReplyContext(message: TelegramMessage): string {
+  const lines: string[] = [];
+  const replyToMessageId = message.reply_to_message?.message_id;
+  const storedReply = typeof replyToMessageId === "number"
+    ? findTelegramMessageRef(String(message.chat.id), replyToMessageId)
+    : null;
+  const replyRole = storedReply?.role || getTelegramMessageRole(message.reply_to_message);
+  const replyContent = storedReply?.content
+    || (message.reply_to_message ? describeTelegramMedia(message.reply_to_message) : null);
+  const quoteText = message.quote?.text?.trim();
+  const externalContent = message.external_reply
+    ? describeTelegramMedia(message.external_reply)
+    : null;
+  const externalQuote = message.external_reply?.quote?.text?.trim() || null;
+  const externalRole = getTelegramMessageRole(message.external_reply);
+
+  if (replyContent) {
+    lines.push("Telegram reply context:");
+    lines.push(`- The user replied to a previous ${replyRole} message.`);
+    lines.push(`- Replied Telegram message id: ${replyToMessageId}`);
+    lines.push("- Replied message content:");
+    lines.push(truncateTelegramContext(replyContent));
+  }
+
+  if (quoteText) {
+    if (lines.length === 0) {
+      lines.push("Telegram reply context:");
+    }
+    lines.push("- The user highlighted this quoted fragment:");
+    lines.push(truncateTelegramContext(quoteText, 400));
+  }
+
+  if (externalContent) {
+    if (lines.length === 0) {
+      lines.push("Telegram reply context:");
+    }
+    lines.push(`- The user also referenced an external ${externalRole} message.`);
+    lines.push("- External referenced content:");
+    lines.push(truncateTelegramContext(externalContent));
+  }
+
+  if (externalQuote) {
+    if (lines.length === 0) {
+      lines.push("Telegram reply context:");
+    }
+    lines.push("- External quoted fragment:");
+    lines.push(truncateTelegramContext(externalQuote, 400));
+  }
+
+  return lines.length > 0 ? `${lines.join("\n")}\n\n` : "";
+}
+
+function buildTelegramUserPrompt(message: TelegramMessage, baseText: string): string {
+  return `${buildTelegramReplyContext(message)}${baseText}`.trim();
+}
+
+function persistTelegramInboundMessage(message: TelegramMessage): void {
+  const content = describeTelegramMedia(message);
+  if (!content.trim()) {
+    return;
+  }
+
+  saveTelegramMessageRef({
+    chatId: String(message.chat.id),
+    messageId: message.message_id,
+    role: "user",
+    content: truncateTelegramContext(content),
+    createdAt: message.date * 1000,
+  });
+}
+
+function persistTelegramAssistantReply(
+  chatId: string,
+  reply: string,
+  sentMessages: TelegramMessage[],
+): void {
+  const content = truncateTelegramContext(reply);
+  if (!content.trim()) {
+    return;
+  }
+
+  const createdAt = Date.now();
+  for (const sentMessage of sentMessages) {
+    saveTelegramMessageRef({
+      chatId,
+      messageId: sentMessage.message_id,
+      role: "assistant",
+      content,
+      createdAt,
+    });
+  }
+}
+
+function shouldSwitchToFinalizingStatus(event: ProviderRuntimeEvent): boolean {
+  return event.type === "item.completed" && event.itemType === "agent_message";
+}
+
+function buildDecisionId(): string {
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function buildDecisionKeyboard(decisionId: string): TelegramInlineKeyboardMarkup {
+  return {
+    inline_keyboard: [[
+      { text: "补充", callback_data: `${CALLBACK_PREFIX}:supplement:${decisionId}` },
+      { text: "排队", callback_data: `${CALLBACK_PREFIX}:queue:${decisionId}` },
+    ]],
+  };
+}
+
+function buildDecisionPromptText(itemCount: number): string {
+  if (itemCount <= 1) {
+    return "收到新消息，如何处理？";
+  }
+  return `收到 ${itemCount} 条新消息，如何处理？`;
+}
+
+function buildSupplementRunningText(itemCount: number): string {
+  if (itemCount > 1) {
+    return `正在重新整理你刚才的 ${itemCount} 条消息…`;
+  }
+  return SUPPLEMENT_RUNNING_TEXT;
+}
+
+function parseDecisionCallback(data?: string): { action: DecisionAction; decisionId: string } | null {
+  if (!data) {
+    return null;
+  }
+
+  const parts = data.split(":");
+  if (parts.length !== 3 || parts[0] !== CALLBACK_PREFIX) {
+    return null;
+  }
+
+  const action = parts[1];
+  if (action !== "supplement" && action !== "queue") {
+    return null;
+  }
+
+  return {
+    action,
+    decisionId: parts[2],
+  };
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isResetCommand(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed === "/new" || trimmed === "/reset" || trimmed === "/start";
 }
 
 export class TelegramChannel implements IChannel {
@@ -66,11 +369,13 @@ export class TelegramChannel implements IChannel {
 
   private config: TelegramChannelConfig | null = null;
   private callbacks: ChannelCallbacks | null = null;
-  private handledUpdateIds = new CappedSet<number>(MAX_HANDLED_IDS);
-  private queueByChat = new Map<string, Promise<void>>();
-  private polling = false;
-  private pollAbort: AbortController | null = null;
-  private botUsername: string | null = null;
+  private handledUpdateIds = new CappedSet<number>(MAX_HANDLED_UPDATE_IDS);
+  private running = false;
+  private pollLoopPromise: Promise<void> | null = null;
+  private pollAbortController: AbortController | null = null;
+  private offset: number | null = null;
+  private readonly workdir = process.env.CODEX_WORKDIR || process.cwd();
+  private readonly chatStates = new Map<string, ChatState>();
 
   async start(callbacks: ChannelCallbacks): Promise<void> {
     const config = readChannelConfig<TelegramChannelConfig>("telegram");
@@ -78,311 +383,632 @@ export class TelegramChannel implements IChannel {
       logger.info("telegram.skipped", { reason: "disabled or missing config" });
       return;
     }
-    if (!config.token) {
-      logger.warn("telegram.skipped", { reason: "missing token" });
+    if (!config.botToken) {
+      logger.warn("telegram.skipped", { reason: "missing botToken" });
       return;
     }
 
     this.config = config;
     this.callbacks = callbacks;
+    this.running = true;
 
-    try {
-      const me = await this.apiCall("getMe");
-      this.botUsername = me.username || null;
-      logger.info("telegram.started", { username: this.botUsername });
-    } catch (error) {
-      logger.error("telegram.getMe_failed", { error });
-      throw error;
-    }
-
-    this.polling = true;
-    this.poll();
+    await this.primeOffset();
+    this.pollLoopPromise = this.pollLoop();
+    logger.info("telegram.started", {
+      privateOnly: config.privateOnly,
+      allowGroups: config.allowGroups,
+      pollingTimeoutSeconds: config.pollingTimeoutSeconds,
+    });
   }
 
   async stop(): Promise<void> {
-    this.polling = false;
-    if (this.pollAbort) {
-      this.pollAbort.abort();
-      this.pollAbort = null;
+    this.running = false;
+    this.pollAbortController?.abort();
+    this.pollAbortController = null;
+
+    for (const state of this.chatStates.values()) {
+      state.decision?.timer && clearTimeout(state.decision.timer);
+      state.running?.abortController.abort();
     }
-    this.callbacks = null;
+
+    try {
+      await this.pollLoopPromise;
+    } catch {
+      // Ignore polling shutdown errors.
+    }
+
+    this.chatStates.clear();
+    this.pollLoopPromise = null;
     this.config = null;
-    this.botUsername = null;
+    this.callbacks = null;
     logger.info("telegram.stopped");
   }
 
-  private apiUrl(method: string): string {
-    return `${TELEGRAM_API}/bot${this.config!.token}/${method}`;
-  }
-
-  private async apiCall(method: string, body?: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
-    const options: RequestInit = {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      signal,
-    };
-    if (body) {
-      options.body = JSON.stringify(body);
-    }
-
-    const res = await fetch(this.apiUrl(method), options);
-    const data = await res.json() as { ok: boolean; result?: any; description?: string };
-    if (!data.ok) {
-      throw new Error(`Telegram API ${method} failed: ${data.description || res.status}`);
-    }
-    return data.result;
-  }
-
-  private async poll(): Promise<void> {
-    let offset = 0;
-
-    while (this.polling) {
-      try {
-        this.pollAbort = new AbortController();
-        const timer = setTimeout(() => this.pollAbort?.abort(), POLL_FETCH_TIMEOUT_MS);
-        let updates: TelegramUpdate[];
-        try {
-          updates = await this.apiCall(
-            "getUpdates",
-            { offset, timeout: POLL_TIMEOUT_SECS, allowed_updates: ["message"] },
-            this.pollAbort.signal,
-          );
-        } finally {
-          clearTimeout(timer);
-        }
-
-        for (const update of updates) {
-          offset = update.update_id + 1;
-
-          if (this.handledUpdateIds.has(update.update_id)) continue;
-          this.handledUpdateIds.add(update.update_id);
-
-          if (update.message) {
-            this.handleMessage(update.message);
-          }
-        }
-      } catch (error: any) {
-        if (error?.name === "AbortError") {
-          if (!this.polling) break;
-          logger.warn("telegram.poll_timeout", { msg: "long poll timed out, retrying" });
-          continue;
-        }
-        logger.error("telegram.poll_error", { error });
-        await new Promise((r) => setTimeout(r, 3000));
-      }
-    }
-  }
-
-  private shouldReplyInGroup(message: TelegramMessage): boolean {
-    if (!message.entities) return false;
-    const text = message.text || "";
-    return message.entities.some((e) => {
-      if (e.type !== "bot_command" && e.type !== "mention") return false;
-      const mention = text.slice(e.offset, e.offset + e.length);
-      if (e.type === "mention" && this.botUsername) {
-        return mention.toLowerCase() === `@${this.botUsername.toLowerCase()}`;
-      }
-      if (e.type === "bot_command" && this.botUsername) {
-        return mention.includes(`@${this.botUsername}`);
-      }
-      return true;
-    });
-  }
-
-  private stripBotMention(text: string): string {
-    if (!this.botUsername) return text;
-    return text.replace(new RegExp(`@${this.botUsername}`, "gi"), "").trim();
-  }
-
-  private enqueueChatTask(chatId: string, task: () => Promise<void>): void {
-    const previous = this.queueByChat.get(chatId) || Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(task)
-      .finally(() => {
-        if (this.queueByChat.get(chatId) === next) {
-          this.queueByChat.delete(chatId);
-        }
-      });
-    this.queueByChat.set(chatId, next);
-  }
-
-  private handleMessage(message: TelegramMessage): void {
-    if (message.from?.is_bot) return;
-    if (message.new_chat_members || message.left_chat_member) return;
-
-    const chatId = String(message.chat.id);
-    const isGroup = message.chat.type === "group" || message.chat.type === "supergroup";
-
-    if (!isGroup && !this.config!.ownerChatId) {
-      this.config!.ownerChatId = chatId;
-      updateChannelConfig("telegram", { ownerChatId: chatId });
-      logger.info("telegram.owner_auto_saved", { chatId });
-    }
-
-    logger.info("telegram.message.received", {
-      messageId: message.message_id,
-      chatId,
-      chatType: message.chat.type,
-      hasPhoto: !!message.photo,
-      ...(shouldLogContent ? { text: rawLogString(message.text || message.caption || "") } : {}),
-    });
-
-    if (message.photo) {
-      if (isGroup && !this.shouldReplyInGroup(message)) return;
-      void this.processPhotoMessage(chatId, message);
-      return;
-    }
-
-    if (!message.text) return;
-
-    if (isGroup && !this.shouldReplyInGroup(message)) return;
-
-    const rawText = this.stripBotMention(message.text);
-    const userText = sanitizeUserText(rawText);
-
-    if (!userText) return;
-
-    const cmd = handleCommand(userText, chatId, "telegram", this.callbacks!);
-    if (cmd.handled) {
-      this.enqueueChatTask(chatId, async () => {
-        if (cmd.reply) await this.sendReply(chatId, cmd.reply);
-      });
-      return;
-    }
-
-    const cleanText = userText.replace(/^\/\w+\s*/, "");
-    if (!cleanText) return;
-
-    this.enqueueChatTask(chatId, async () => {
-      try {
-        await this.apiCall("sendChatAction", { chat_id: message.chat.id, action: "typing" });
-      } catch { /* best effort */ }
-
-      try {
-        const reply = await this.callbacks!.generateReply(chatId, cleanText, undefined, "telegram");
-        await this.sendReply(chatId, reply);
-      } catch (error) {
-        logger.error("telegram.text.failed", {
-          messageId: message.message_id,
-          chatId,
-          error,
-        });
-        await this.sendText(chatId, "处理消息时出错了，请稍后再试。");
-      }
-    });
-  }
-
-  private async processPhotoMessage(chatId: string, message: TelegramMessage): Promise<void> {
-    this.enqueueChatTask(chatId, async () => {
-      let imagePath: string | null = null;
-      try {
-        await this.apiCall("sendChatAction", { chat_id: message.chat.id, action: "typing" });
-      } catch { /* best effort */ }
-
-      try {
-        const photos = message.photo!;
-        const largest = photos[photos.length - 1];
-        imagePath = await this.downloadFile(largest.file_id);
-
-        const caption = message.caption
-          ? sanitizeUserText(this.stripBotMention(message.caption))
-          : "";
-        const userText = caption ||
-          "用户发来了一张图片。请先根据图片内容直接回答；如果缺少上下文，就先简要描述图片里有什么，并询问对方希望你进一步做什么。";
-
-        const reply = await this.callbacks!.generateReply(chatId, userText, [imagePath], "telegram");
-        await this.sendReply(chatId, reply);
-      } catch (error) {
-        logger.error("telegram.photo.failed", {
-          messageId: message.message_id,
-          chatId,
-          error,
-        });
-        await this.sendText(chatId, "图片收到了，但处理失败，请稍后再试。");
-      } finally {
-        if (imagePath) {
-          await rm(path.dirname(imagePath), { recursive: true, force: true }).catch(() => {});
-        }
-      }
-    });
-  }
-
-  private async downloadFile(fileId: string): Promise<string> {
-    const file = await this.apiCall("getFile", { file_id: fileId });
-    const filePath: string = file.file_path;
-    const url = `${TELEGRAM_API}/file/bot${this.config!.token}/${filePath}`;
-
-    const res = await fetch(url);
-    if (!res.ok) {
-      throw new Error(`Failed to download file: HTTP ${res.status}`);
-    }
-
-    const buffer = Buffer.from(await res.arrayBuffer());
-    const ext = path.extname(filePath) || ".jpg";
-    const dir = await mkdtemp(path.join(tmpdir(), "tg-img-"));
-    const localPath = path.join(dir, `photo${ext}`);
-    await writeFile(localPath, buffer);
-
-    return localPath;
-  }
-
-  private async sendReply(chatId: string, text: string): Promise<void> {
-    const chunks = this.splitMessage(text);
-    for (const chunk of chunks) {
-      await this.sendText(chatId, chunk);
-    }
-  }
-
-  private splitMessage(text: string): string[] {
-    if (text.length <= TG_MAX_MESSAGE_LENGTH) return [text];
-
-    const chunks: string[] = [];
-    let remaining = text;
-    while (remaining.length > 0) {
-      if (remaining.length <= TG_MAX_MESSAGE_LENGTH) {
-        chunks.push(remaining);
-        break;
-      }
-      let splitAt = remaining.lastIndexOf("\n", TG_MAX_MESSAGE_LENGTH);
-      if (splitAt <= 0) splitAt = TG_MAX_MESSAGE_LENGTH;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt).trimStart();
-    }
-    return chunks;
-  }
-
   async sendToOwner(text: string): Promise<void> {
-    if (!this.config) {
+    if (!this.config?.botToken) {
       throw new Error("Telegram channel is not started");
     }
-    const ownerChatId = this.config.ownerChatId;
-    if (!ownerChatId) {
-      throw new Error("Telegram ownerChatId 未配置，请先私聊机器人一次（会自动记录），或在设置中手动填写");
+    if (!this.config.ownerChatId) {
+      throw new Error("Telegram ownerChatId 未配置，请先私聊机器人一次，或在设置中手动填写");
     }
-    const chunks = this.splitMessage(text);
-    for (const chunk of chunks) {
-      await this.sendText(ownerChatId, chunk);
+    await sendTelegramReply(this.config.botToken, this.config.ownerChatId, text, this.workdir);
+  }
+
+  private getChatState(chatId: string): ChatState {
+    let state = this.chatStates.get(chatId);
+    if (!state) {
+      state = {
+        running: null,
+        decision: null,
+        queued: [],
+        pendingRestart: null,
+        generation: 0,
+      };
+      this.chatStates.set(chatId, state);
+    }
+    return state;
+  }
+
+  private async primeOffset(): Promise<void> {
+    if (!this.config?.botToken) {
+      return;
+    }
+
+    try {
+      const updates = await getTelegramUpdates(this.config.botToken, null, 0);
+      if (updates.length > 0) {
+        this.offset = updates[updates.length - 1]!.update_id + 1;
+      }
+    } catch (error) {
+      logger.warn("telegram.offset.prime_failed", { error });
     }
   }
 
-  private async sendText(chatId: string, text: string): Promise<void> {
-    try {
-      await this.apiCall("sendMessage", {
-        chat_id: Number(chatId),
-        text,
-        parse_mode: "Markdown",
-      });
-    } catch (error) {
-      logger.warn("telegram.send.markdown_failed", { chatId, error });
+  private async pollLoop(): Promise<void> {
+    while (this.running && this.config?.botToken) {
+      this.pollAbortController = new AbortController();
+
       try {
-        await this.apiCall("sendMessage", {
-          chat_id: Number(chatId),
-          text,
-        });
-      } catch (fallbackError) {
-        logger.error("telegram.send.failed", { chatId, error: fallbackError });
+        const updates = await getTelegramUpdates(
+          this.config.botToken,
+          this.offset,
+          this.config.pollingTimeoutSeconds,
+          this.pollAbortController.signal,
+        );
+
+        for (const update of updates) {
+          void this.handleUpdate(update).catch((error) => {
+            logger.error("telegram.update.handle_failed", {
+              updateId: update.update_id,
+              error,
+            });
+          });
+          this.offset = update.update_id + 1;
+        }
+      } catch (error) {
+        if (!this.running) {
+          break;
+        }
+        if ((error as Error).name === "AbortError") {
+          continue;
+        }
+
+        logger.error("telegram.poll.failed", { error });
+        await delay(2000);
+      } finally {
+        this.pollAbortController = null;
       }
     }
+  }
+
+  private async handleUpdate(update: TelegramUpdate): Promise<void> {
+    if (this.handledUpdateIds.has(update.update_id)) {
+      return;
+    }
+    this.handledUpdateIds.add(update.update_id);
+
+    if (update.callback_query) {
+      await this.handleCallbackQuery(update.callback_query);
+      return;
+    }
+
+    if (!update.message) {
+      return;
+    }
+
+    const message = update.message;
+    const config = this.config!;
+
+    logger.info("telegram.message.received", {
+      updateId: update.update_id,
+      messageId: message.message_id,
+      chatId: message.chat.id,
+      chatType: message.chat.type,
+      hasText: Boolean(message.text),
+      hasPhoto: Boolean(message.photo?.length),
+      hasDocument: Boolean(message.document),
+    });
+
+    if (config.privateOnly && !isPrivateMessage(message)) {
+      return;
+    }
+    if (!config.allowGroups && message.chat.type !== "private") {
+      return;
+    }
+
+    if (isPrivateMessage(message) && !config.ownerChatId) {
+      config.ownerChatId = String(message.chat.id);
+      updateChannelConfig("telegram", { ownerChatId: config.ownerChatId });
+      logger.info("telegram.owner_auto_saved", {
+        chatId: message.chat.id,
+      });
+    }
+
+    persistTelegramInboundMessage(message);
+
+    if (message.document && !isSupportedFeishuDocumentFileName(message.document.file_name || "unknown")) {
+      await sendTelegramMessage(config.botToken, message.chat.id, buildUnsupportedFeishuFileMessage(
+        message.document.file_name || "unknown",
+      ));
+      return;
+    }
+
+    await this.handleIncomingMessage(message);
+  }
+
+  private async handleIncomingMessage(message: TelegramMessage): Promise<void> {
+    const botToken = this.config!.botToken;
+    const chatId = String(message.chat.id);
+    const userText = getMessageText(message);
+    const state = this.getChatState(chatId);
+
+    if (!message.photo?.length && !message.document && !userText) {
+      await sendTelegramMessage(botToken, message.chat.id, "请直接发送文字问题。");
+      return;
+    }
+
+    if (userText) {
+      const cmd = await handleCommand(userText, chatId, "telegram", this.callbacks!);
+      if (cmd.handled) {
+        if (isResetCommand(userText)) {
+          await this.resetChatState(state);
+        }
+        if (cmd.reply) {
+          await sendTelegramMessage(botToken, message.chat.id, cmd.reply);
+        }
+        return;
+      }
+    }
+
+    const item: PendingItem = {
+      kind: message.photo?.length ? "photo" : message.document ? "document" : "text",
+      message,
+    };
+
+    if (!state.running) {
+      const batch = this.createBatch(botToken, message, [item]);
+      await this.startBatch(chatId, state, batch, RUNNING_STATUS_TEXT);
+      return;
+    }
+
+    if (state.decision) {
+      const existingItems = [...state.decision.batch.items, item];
+      if (state.decision.timer) {
+        clearTimeout(state.decision.timer);
+        state.decision.timer = null;
+      }
+
+      await state.decision.batch.status.delete();
+
+      const refreshedBatch = this.createBatch(botToken, message, existingItems);
+      const refreshedDecision: PendingDecision = {
+        id: buildDecisionId(),
+        batch: refreshedBatch,
+        timer: null,
+      };
+      state.decision = refreshedDecision;
+
+      await refreshedBatch.status.show(
+        buildDecisionPromptText(existingItems.length),
+        {
+          replyMarkup: buildDecisionKeyboard(refreshedDecision.id),
+        },
+      );
+      this.resetDecisionTimer(chatId, state, refreshedDecision);
+      return;
+    }
+
+    const decisionBatch = this.createBatch(botToken, message, [item]);
+    const decisionId = buildDecisionId();
+    const decision: PendingDecision = {
+      id: decisionId,
+      batch: decisionBatch,
+      timer: null,
+    };
+    state.decision = decision;
+
+    await decision.batch.status.show(buildDecisionPromptText(decision.batch.items.length), {
+      replyMarkup: buildDecisionKeyboard(decisionId),
+    });
+    this.resetDecisionTimer(chatId, state, decision);
+  }
+
+  private createBatch(
+    botToken: string,
+    anchorMessage: TelegramMessage,
+    items: PendingItem[],
+  ): PendingBatch {
+    return {
+      id: buildDecisionId(),
+      items,
+      status: new StatusMessageController(botToken, anchorMessage.chat.id, anchorMessage.message_id),
+    };
+  }
+
+  private resetDecisionTimer(chatId: string, state: ChatState, decision: PendingDecision): void {
+    if (decision.timer) {
+      clearTimeout(decision.timer);
+    }
+
+    decision.timer = setTimeout(() => {
+      void this.resolveDecision(chatId, state, decision.id, "supplement", true);
+    }, DECISION_TIMEOUT_MS);
+  }
+
+  private async handleCallbackQuery(callbackQuery: TelegramCallbackQuery): Promise<void> {
+    const parsed = parseDecisionCallback(callbackQuery.data);
+    if (!parsed || !callbackQuery.message || !callbackQuery.message.chat) {
+      await answerTelegramCallbackQuery(this.config!.botToken, callbackQuery.id, {
+        text: STALE_DECISION_TEXT,
+      }).catch(() => {});
+      return;
+    }
+
+    const chatId = String(callbackQuery.message.chat.id);
+    const state = this.getChatState(chatId);
+    const decision = state.decision;
+
+    if (!decision || decision.id !== parsed.decisionId) {
+      await answerTelegramCallbackQuery(this.config!.botToken, callbackQuery.id, {
+        text: STALE_DECISION_TEXT,
+      }).catch(() => {});
+      return;
+    }
+
+    await answerTelegramCallbackQuery(this.config!.botToken, callbackQuery.id).catch(() => {});
+    await this.resolveDecision(chatId, state, parsed.decisionId, parsed.action, false);
+  }
+
+  private async resolveDecision(
+    chatId: string,
+    state: ChatState,
+    decisionId: string,
+    action: DecisionAction,
+    fromTimeout: boolean,
+  ): Promise<void> {
+    const decision = state.decision;
+    if (!decision || decision.id !== decisionId) {
+      return;
+    }
+
+    if (decision.timer) {
+      clearTimeout(decision.timer);
+      decision.timer = null;
+    }
+    state.decision = null;
+
+    if (action === "queue") {
+      await decision.batch.status.show(QUEUED_STATUS_TEXT, { clearKeyboard: true });
+      state.queued.push(decision.batch);
+      return;
+    }
+
+    await decision.batch.status.show(
+      fromTimeout ? SUPPLEMENT_TIMEOUT_TEXT : SUPPLEMENT_STATUS_TEXT,
+      { clearKeyboard: true },
+    );
+
+    const running = state.running;
+    if (!running) {
+      state.pendingRestart = {
+        batch: decision.batch,
+        earliestStartAt: Date.now() + SUPPLEMENT_CONFIRM_MS,
+        combinedItemCount: decision.batch.items.length,
+      };
+      await this.maybeStartNextBatch(chatId, state);
+      return;
+    }
+
+    const mergedBatch: PendingBatch = {
+      id: buildDecisionId(),
+      items: [...running.batch.items, ...decision.batch.items],
+      status: decision.batch.status,
+    };
+
+    state.pendingRestart = {
+      batch: mergedBatch,
+      earliestStartAt: Date.now() + SUPPLEMENT_CONFIRM_MS,
+      combinedItemCount: mergedBatch.items.length,
+    };
+
+    await running.batch.status.delete();
+    running.abortController.abort();
+  }
+
+  private async startBatch(
+    chatId: string,
+    state: ChatState,
+    batch: PendingBatch,
+    startText: string,
+  ): Promise<void> {
+    if (state.running) {
+      return;
+    }
+
+    state.generation += 1;
+    const running: RunningTask = {
+      id: buildDecisionId(),
+      batch,
+      abortController: new AbortController(),
+      generation: state.generation,
+    };
+    state.running = running;
+
+    await batch.status.show(startText, { clearKeyboard: true });
+
+    void this.executeBatch(chatId, state, running).catch((error) => {
+      logger.error("telegram.batch.unhandled_failure", {
+        chatId,
+        batchId: batch.id,
+        error,
+      });
+    });
+  }
+
+  private async executeBatch(
+    chatId: string,
+    state: ChatState,
+    running: RunningTask,
+  ): Promise<void> {
+    const currentRunning = state.running;
+    if (!currentRunning || currentRunning.id !== running.id) {
+      return;
+    }
+
+    const botToken = this.config!.botToken;
+    const cleanupDirs = new Set<string>();
+
+    try {
+      const prepared = await this.prepareBatchInput(botToken, running.batch, cleanupDirs);
+      let finalizingStatusSent = false;
+      const handleProviderEvent = (event: ProviderRuntimeEvent) => {
+        if (
+          state.running?.id !== running.id
+          || finalizingStatusSent
+          || !shouldSwitchToFinalizingStatus(event)
+        ) {
+          return;
+        }
+
+        finalizingStatusSent = true;
+        void running.batch.status.show(FINALIZING_STATUS_TEXT);
+      };
+
+      const reply = await this.callbacks!.generateReply(
+        chatId,
+        prepared.userText,
+        prepared.imagePaths,
+        "telegram",
+        handleProviderEvent,
+        running.abortController.signal,
+      );
+
+      if (running.abortController.signal.aborted || state.running?.id !== running.id) {
+        return;
+      }
+
+      await running.batch.status.show(SENDING_STATUS_TEXT);
+      const sentMessages = await sendTelegramReplyWithMessages(
+        botToken,
+        chatId,
+        reply,
+        this.workdir,
+      );
+
+      if (state.running?.id !== running.id) {
+        return;
+      }
+
+      persistTelegramAssistantReply(chatId, reply, sentMessages);
+      await running.batch.status.delete();
+    } catch (error) {
+      if (running.abortController.signal.aborted) {
+        logger.info("telegram.batch.aborted", {
+          chatId,
+          batchId: running.batch.id,
+        });
+      } else {
+        logger.error("telegram.batch.failed", {
+          chatId,
+          batchId: running.batch.id,
+          error,
+        });
+        if (state.running?.id === running.id) {
+          await running.batch.status.show("处理消息时出错了，请稍后再试。");
+        }
+      }
+    } finally {
+      for (const cleanupDir of cleanupDirs) {
+        await rm(cleanupDir, { recursive: true, force: true }).catch(() => {});
+      }
+
+      if (state.running?.id === running.id) {
+        state.running = null;
+      }
+
+      await this.maybeStartNextBatch(chatId, state);
+    }
+  }
+
+  private async maybeStartNextBatch(chatId: string, state: ChatState): Promise<void> {
+    if (state.running) {
+      return;
+    }
+
+    if (state.pendingRestart) {
+      const restart = state.pendingRestart;
+      state.pendingRestart = null;
+
+      const waitMs = restart.earliestStartAt - Date.now();
+      if (waitMs > 0) {
+        await delay(waitMs);
+      }
+
+      if (state.running) {
+        return;
+      }
+
+      await this.startBatch(
+        chatId,
+        state,
+        restart.batch,
+        buildSupplementRunningText(restart.combinedItemCount),
+      );
+      return;
+    }
+
+    if (state.decision) {
+      const decision = state.decision;
+      if (decision.timer) {
+        clearTimeout(decision.timer);
+        decision.timer = null;
+      }
+      state.decision = null;
+      await this.startBatch(chatId, state, decision.batch, RUNNING_STATUS_TEXT);
+      return;
+    }
+
+    const nextQueued = state.queued.shift();
+    if (nextQueued) {
+      await this.startBatch(chatId, state, nextQueued, RUNNING_STATUS_TEXT);
+    }
+  }
+
+  private async prepareBatchInput(
+    botToken: string,
+    batch: PendingBatch,
+    cleanupDirs: Set<string>,
+  ): Promise<{ userText: string; imagePaths: string[] }> {
+    const sections: string[] = [];
+    const imagePaths: string[] = [];
+
+    for (const [index, item] of batch.items.entries()) {
+      if (item.kind === "text") {
+        sections.push(this.formatBatchSection(
+          batch.items.length,
+          index,
+          buildTelegramUserPrompt(item.message, getMessageText(item.message)),
+        ));
+        continue;
+      }
+
+      if (item.kind === "photo") {
+        const photo = item.message.photo?.[item.message.photo.length - 1];
+        if (!photo) {
+          sections.push(this.formatBatchSection(
+            batch.items.length,
+            index,
+            buildTelegramUserPrompt(item.message, "用户发来了一张图片。请根据图片内容直接回答。"),
+          ));
+          continue;
+        }
+
+        const downloaded = await downloadTelegramFile(botToken, photo.file_id, "telegram-photo.jpg");
+        imagePaths.push(downloaded.filePath);
+        cleanupDirs.add(path.dirname(downloaded.filePath));
+        sections.push(this.formatBatchSection(
+          batch.items.length,
+          index,
+          buildTelegramUserPrompt(
+            item.message,
+            getMessageText(item.message) || "用户发来了一张图片。请根据图片内容直接回答。",
+          ),
+        ));
+        continue;
+      }
+
+      const document = item.message.document;
+      if (!document?.file_id) {
+        sections.push(this.formatBatchSection(
+          batch.items.length,
+          index,
+          buildTelegramUserPrompt(item.message, "用户发来了一个文件，但附件内容暂时无法读取。"),
+        ));
+        continue;
+      }
+
+      const downloaded = await downloadTelegramFile(
+        botToken,
+        document.file_id,
+        document.file_name || "telegram-document",
+      );
+      cleanupDirs.add(path.dirname(downloaded.filePath));
+      const text = [
+        "用户发来了一个文件。",
+        `文件名: ${downloaded.fileName}`,
+        `本地路径: ${downloaded.filePath}`,
+        "",
+        "请优先读取并理解这个文件，再直接回答用户可能想了解的内容。",
+        "如果文件内容不足以完成任务，先简要说明你从文件里看到了什么，再说明还需要什么上下文。",
+        "如果该文件格式不适合直接解析，也请明确说明限制。",
+      ].join("\n");
+      sections.push(this.formatBatchSection(
+        batch.items.length,
+        index,
+        buildTelegramUserPrompt(item.message, text),
+      ));
+    }
+
+    if (sections.length === 1) {
+      return {
+        userText: sections[0]!,
+        imagePaths,
+      };
+    }
+
+    return {
+      userText: [
+        "The following new messages arrived sequentially in the same Telegram chat.",
+        "Treat later items as immediate additions or follow-ups to the same conversation unless they explicitly redirect the task.",
+        "",
+        sections.join("\n\n"),
+      ].join("\n"),
+      imagePaths,
+    };
+  }
+
+  private formatBatchSection(total: number, index: number, text: string): string {
+    if (total <= 1) {
+      return text;
+    }
+
+    return `Message ${index + 1}:\n${text}`;
+  }
+
+  private async resetChatState(state: ChatState): Promise<void> {
+    state.decision?.timer && clearTimeout(state.decision.timer);
+    state.decision = null;
+    state.pendingRestart = null;
+
+    if (state.running) {
+      state.running.abortController.abort();
+      await state.running.batch.status.delete();
+      state.running = null;
+    }
+
+    for (const queued of state.queued) {
+      await queued.status.delete();
+    }
+    state.queued = [];
   }
 }

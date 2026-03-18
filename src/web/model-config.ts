@@ -1,15 +1,10 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-  getProvider,
-  getRegisteredProviderTypes,
-  switchProvider,
-  createProvider,
-} from "../providers/index.js";
+import { getProvider, REGISTERED_PROVIDER_TYPE } from "../providers/index.js";
+import { getDataDir } from "../runtime-paths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.resolve(__dirname, "../../.data/model-config.json");
+const CONFIG_PATH = path.join(getDataDir(), "model-config.json");
 
 export interface ModelEntry {
   id: string;
@@ -21,7 +16,11 @@ export interface ModelConfig {
   provider: string;
   currentModel: string;
   models: ModelEntry[];
-  lastSelected: Record<string, string>;
+}
+
+function readEnvModel(): string | null {
+  const model = process.env.CODEX_MODEL?.trim();
+  return model ? model : null;
 }
 
 function buildDefaultConfig(): ModelConfig {
@@ -29,10 +28,64 @@ function buildDefaultConfig(): ModelConfig {
   const models = provider.listModels();
   return {
     provider: provider.type,
-    currentModel: models[0]?.id ?? "",
+    currentModel: getDefaultModel(models),
     models,
-    lastSelected: { [provider.type]: models[0]?.id ?? "" },
   };
+}
+
+function getCodexConfigPath(): string {
+  if (process.env.CODEX_HOME?.trim()) {
+    return path.resolve(process.env.CODEX_HOME, "config.toml");
+  }
+
+  return path.resolve(os.homedir(), ".codex", "config.toml");
+}
+
+function readCodexConfigModel(): string | null {
+  const configPath = getCodexConfigPath();
+  if (!existsSync(configPath)) {
+    return null;
+  }
+
+  const raw = readFileSync(configPath, "utf-8");
+  let inTopLevel = true;
+
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    if (trimmed.startsWith("[")) {
+      inTopLevel = false;
+      continue;
+    }
+
+    if (!inTopLevel) {
+      continue;
+    }
+
+    const match = trimmed.match(/^model\s*=\s*["']([^"']+)["'](?:\s+#.*)?$/);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+function getDefaultModel(models: ModelEntry[]): string {
+  const envModel = readEnvModel();
+  if (envModel && models.some((model) => model.id === envModel)) {
+    return envModel;
+  }
+
+  const configuredModel = readCodexConfigModel();
+  if (configuredModel && models.some((model) => model.id === configuredModel)) {
+    return configuredModel;
+  }
+
+  return models[0]?.id ?? "";
 }
 
 function ensureConfig(): void {
@@ -44,27 +97,31 @@ function ensureConfig(): void {
 export function readModelConfig(): ModelConfig {
   ensureConfig();
   const raw = readFileSync(CONFIG_PATH, "utf-8");
-  const config = JSON.parse(raw) as ModelConfig;
-
-  if (!config.lastSelected) {
-    config.lastSelected = {};
-  }
+  const config = JSON.parse(raw) as Partial<ModelConfig>;
 
   const provider = getProvider();
-  const needsRefresh =
-    config.provider !== provider.type ||
-    !config.models ||
-    config.models.length === 0 ||
-    (config.models.length === 1 && config.models[0].id === "auto");
+  const models = provider.listModels();
+  const envModel = readEnvModel();
+  const normalized: ModelConfig = {
+    provider: REGISTERED_PROVIDER_TYPE,
+    currentModel:
+      envModel && models.some((m) => m.id === envModel)
+        ? envModel
+        : config.currentModel && models.some((m) => m.id === config.currentModel)
+        ? config.currentModel
+        : getDefaultModel(models),
+    models,
+  };
 
-  if (needsRefresh) {
-    config.provider = provider.type;
-    config.models = provider.listModels();
-    config.currentModel = config.lastSelected[provider.type] || config.models[0]?.id || "";
-    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
+  if (
+    config.provider !== normalized.provider ||
+    config.currentModel !== normalized.currentModel ||
+    JSON.stringify(config.models ?? []) !== JSON.stringify(normalized.models)
+  ) {
+    writeFileSync(CONFIG_PATH, JSON.stringify(normalized, null, 2), "utf-8");
   }
 
-  return config;
+  return normalized;
 }
 
 export function getCurrentModel(): string {
@@ -72,40 +129,27 @@ export function getCurrentModel(): string {
 }
 
 export function getCurrentProviderType(): string {
-  return readModelConfig().provider;
+  return REGISTERED_PROVIDER_TYPE;
 }
 
 export function setCurrentModel(modelId: string): ModelConfig {
   const config = readModelConfig();
+  const envModel = readEnvModel();
+  if (envModel && envModel !== modelId) {
+    throw new Error(`Model is locked by CODEX_MODEL=${envModel}`);
+  }
   const valid = config.models.some((m) => m.id === modelId);
   if (!valid) {
-    throw new Error(`不支持的模型: ${modelId}`);
-  }
-  config.currentModel = modelId;
-  config.lastSelected[config.provider] = modelId;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
-  return config;
-}
-
-export function setCurrentProvider(
-  providerType: string,
-  providerConfig?: Record<string, unknown>,
-): ModelConfig {
-  const registered = getRegisteredProviderTypes();
-  if (!registered.includes(providerType)) {
-    throw new Error(`不支持的 Provider: ${providerType}。可用: ${registered.join(", ")}`);
+    throw new Error(`Unsupported model: ${modelId}`);
   }
 
-  const config = readModelConfig();
-  config.lastSelected[config.provider] = config.currentModel;
-  config.provider = providerType;
-
-  const newProvider = switchProvider(providerType, providerConfig);
-  config.models = newProvider.listModels();
-  config.currentModel = config.lastSelected[providerType] || config.models[0]?.id || "";
-
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), "utf-8");
-  return config;
+  const nextConfig: ModelConfig = {
+    provider: REGISTERED_PROVIDER_TYPE,
+    currentModel: modelId,
+    models: config.models,
+  };
+  writeFileSync(CONFIG_PATH, JSON.stringify(nextConfig, null, 2), "utf-8");
+  return nextConfig;
 }
 
 export function getProviderTypes(): Array<{
@@ -113,12 +157,12 @@ export function getProviderTypes(): Array<{
   displayName: string;
   capabilities: Record<string, boolean>;
 }> {
-  return getRegisteredProviderTypes().map((type) => {
-    const p = createProvider(type);
-    return {
-      type: p.type,
-      displayName: p.displayName,
-      capabilities: { ...p.capabilities },
-    };
-  });
+  const provider = getProvider();
+  return [
+    {
+      type: provider.type,
+      displayName: provider.displayName,
+      capabilities: { ...provider.capabilities },
+    },
+  ];
 }

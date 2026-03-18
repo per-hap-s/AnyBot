@@ -9,8 +9,15 @@ import {
   sendReply,
   sendAckReaction,
   downloadImageFromMessage,
+  downloadFileFromMessage,
 } from "../lark.js";
-import { parseIncomingText, sanitizeUserText } from "../message.js";
+import {
+  parseIncomingText,
+  sanitizeUserText,
+  isSupportedFeishuDocumentFileName,
+  parseIncomingFileInfo,
+  buildUnsupportedFeishuFileMessage,
+} from "../message.js";
 import { includeContentInLogs, logger, rawLogString } from "../logger.js";
 import { handleCommand } from "./commands.js";
 
@@ -146,6 +153,21 @@ export class FeishuChannel implements IChannel {
     this.queueByChat.set(chatId, next);
   }
 
+  private async sendFileProgress(
+    client: Lark.Client,
+    chatId: string,
+    text: string,
+  ): Promise<void> {
+    try {
+      await sendText(client, chatId, text);
+    } catch (error) {
+      logger.warn("feishu.file.progress_failed", {
+        chatId,
+        error,
+      });
+    }
+  }
+
   private async handleMessage(event: {
     sender: { sender_type: string };
     message: {
@@ -191,8 +213,16 @@ export class FeishuChannel implements IChannel {
     if (this.handledMessageIds.has(message.message_id)) return;
     this.handledMessageIds.add(message.message_id);
 
-    if (message.message_type !== "text" && message.message_type !== "image") {
-      await sendText(client, message.chat_id, "目前只支持文本和图片消息。");
+    if (
+      message.message_type !== "text" &&
+      message.message_type !== "image" &&
+      message.message_type !== "file"
+    ) {
+      await sendText(
+        client,
+        message.chat_id,
+        "目前支持文本、图片和常见文档文件。文档类型包括 PDF、Office、CSV/TSV、TXT/Markdown、JSON/YAML/XML，以及常见代码文件。",
+      );
       return;
     }
 
@@ -212,6 +242,11 @@ export class FeishuChannel implements IChannel {
       return;
     }
 
+    if (message.message_type === "file") {
+      void this.processFileMessage(client, config, message);
+      return;
+    }
+
     void this.processTextMessage(client, config, message);
   }
 
@@ -228,7 +263,7 @@ export class FeishuChannel implements IChannel {
       return;
     }
 
-    const cmd = handleCommand(userText, message.chat_id, "feishu", this.callbacks!);
+    const cmd = await handleCommand(userText, message.chat_id, "feishu", this.callbacks!);
     if (cmd.handled) {
       if (cmd.reply) await sendText(client, message.chat_id, cmd.reply);
       return;
@@ -310,6 +345,107 @@ export class FeishuChannel implements IChannel {
       } finally {
         if (imagePath) {
           await rm(path.dirname(imagePath), {
+            recursive: true,
+            force: true,
+          }).catch(() => {});
+        }
+      }
+    });
+  }
+
+  private async processFileMessage(
+    client: Lark.Client,
+    config: FeishuChannelConfig,
+    message: {
+      message_id: string;
+      chat_id: string;
+      message_type: string;
+      content: string;
+    },
+  ): Promise<void> {
+    const fileInfo = parseIncomingFileInfo(message.content);
+    const fileName = fileInfo?.fileName || "unknown";
+
+    if (!fileInfo?.fileKey || !fileInfo.fileName) {
+      await sendText(
+        client,
+        message.chat_id,
+        "文件收到了，但暂时无法解析这个附件的元信息，请换一个常见文档格式再试。",
+      );
+      return;
+    }
+
+    if (!isSupportedFeishuDocumentFileName(fileInfo.fileName)) {
+      await sendText(
+        client,
+        message.chat_id,
+        buildUnsupportedFeishuFileMessage(fileInfo.fileName),
+      );
+      return;
+    }
+
+    try {
+      await sendAckReaction(client, message.message_id, config.ackReaction);
+    } catch (error) {
+      logger.warn("feishu.ack_failed", {
+        messageId: message.message_id,
+        error,
+      });
+    }
+
+    await this.sendFileProgress(
+      client,
+      message.chat_id,
+      `已收到文件 \`${fileInfo.fileName}\`，正在下载附件...`,
+    );
+
+    let filePath: string | null = null;
+
+    this.enqueueChatTask(message.chat_id, async () => {
+      try {
+        const downloaded = await downloadFileFromMessage(client, message);
+        filePath = downloaded.filePath;
+        await this.sendFileProgress(
+          client,
+          message.chat_id,
+          `附件 \`${downloaded.fileName}\` 已下载，正在读取内容...`,
+        );
+        const userText = [
+          "用户发来了一个文件。",
+          `文件名: ${downloaded.fileName}`,
+          `本地路径: ${downloaded.filePath}`,
+          "",
+          "请优先读取并理解这个文件，再直接回答用户可能想了解的内容。",
+          "如果文件内容不足以完成任务，先简要说明你从文件里看到了什么，再告诉用户你还需要什么上下文。",
+          "如果该文件格式不适合直接解析，也请明确说明限制，而不是假装已经读懂。",
+        ].join("\n");
+        await this.sendFileProgress(
+          client,
+          message.chat_id,
+          `正在分析 \`${downloaded.fileName}\`，请稍候...`,
+        );
+        const reply = await this.callbacks!.generateReply(
+          message.chat_id,
+          userText,
+          undefined,
+          "feishu",
+        );
+        await sendReply(client, message.chat_id, reply, this.workdir);
+      } catch (error) {
+        logger.error("feishu.file.failed", {
+          messageId: message.message_id,
+          chatId: message.chat_id,
+          fileName,
+          error,
+        });
+        await sendText(
+          client,
+          message.chat_id,
+          "文件收到了，但处理失败。请确认机器人有读取附件资源的权限，并优先发送常见文档格式。",
+        );
+      } finally {
+        if (filePath) {
+          await rm(path.dirname(filePath), {
             recursive: true,
             force: true,
           }).catch(() => {});

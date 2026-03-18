@@ -6,6 +6,7 @@ type RawLogString = {
 
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
+import { getRunDir } from "./runtime-paths.js";
 
 const levelWeight: Record<LogLevel, number> = {
   debug: 10,
@@ -18,7 +19,7 @@ const configuredLevel = parseLogLevel(process.env.LOG_LEVEL);
 const logContentEnabled = parseBooleanFlag(process.env.LOG_INCLUDE_CONTENT);
 const logPromptEnabled = parseBooleanFlag(process.env.LOG_INCLUDE_PROMPT);
 const logToStdout = resolveLogToStdout(process.env.LOG_TO_STDOUT);
-const logDir = path.resolve(process.env.LOG_DIR || ".run");
+const logDir = path.resolve(getRunDir());
 const logBaseName = process.env.LOG_BASENAME || "bot.log";
 
 function parseLogLevel(value?: string): LogLevel {

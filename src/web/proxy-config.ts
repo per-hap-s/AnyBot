@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { getDataDir } from "../runtime-paths.js";
 
 export interface ProxyConfig {
   enabled: boolean;
@@ -11,8 +11,7 @@ export interface ProxyConfig {
   password?: string;
 }
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.resolve(__dirname, "../../.data/proxy.json");
+const CONFIG_PATH = path.join(getDataDir(), "proxy.json");
 
 const DEFAULT_CONFIG: ProxyConfig = {
   enabled: false,

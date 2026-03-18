@@ -1,39 +1,30 @@
+import type { ProviderRuntimeEvent } from "../providers/index.js";
+
 export interface ChannelConfig {
   enabled: boolean;
-  appId: string;
-  appSecret: string;
   ownerChatId?: string;
   [key: string]: unknown;
 }
 
 export interface FeishuChannelConfig extends ChannelConfig {
+  appId: string;
+  appSecret: string;
   groupChatMode: "mention" | "all";
   botOpenId: string;
   ackReaction: string;
 }
 
-export interface QQBotChannelConfig extends ChannelConfig {
-  [key: string]: unknown;
-}
-
-export interface TelegramChannelConfig {
-  enabled: boolean;
-  token: string;
-  ownerChatId?: string;
-  [key: string]: unknown;
+export interface TelegramChannelConfig extends ChannelConfig {
+  botToken: string;
+  privateOnly: boolean;
+  allowGroups: boolean;
+  pollingTimeoutSeconds: number;
 }
 
 export interface ChannelsConfig {
-  [channelType: string]: ChannelConfig | TelegramChannelConfig | undefined;
+  [channelType: string]: ChannelConfig | undefined;
   feishu?: FeishuChannelConfig;
-  qqbot?: QQBotChannelConfig;
   telegram?: TelegramChannelConfig;
-}
-
-export interface ProviderInfo {
-  type: string;
-  displayName: string;
-  isCurrent: boolean;
 }
 
 export interface ModelInfo {
@@ -49,12 +40,16 @@ export interface ChannelCallbacks {
     userText: string,
     imagePaths?: string[],
     source?: string,
+    onEvent?: (event: ProviderRuntimeEvent) => void,
+    signal?: AbortSignal,
   ) => Promise<string>;
   resetSession: (chatId: string, source?: string) => void;
-  listProviders: () => ProviderInfo[];
-  switchProvider: (providerType: string) => { success: boolean; message: string };
   listModels: () => ModelInfo[];
   switchModel: (modelId: string) => { success: boolean; message: string };
+  getMemoryStatus: () => string;
+  remember: (text: string) => Promise<{ success: boolean; message: string }>;
+  updateProfile: (text: string) => Promise<{ success: boolean; message: string }>;
+  compressMemory: () => Promise<{ success: boolean; message: string }>;
 }
 
 export interface IChannel {

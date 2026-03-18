@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "node:path";
 import fs from "node:fs";
+import { getDataDir } from "../runtime-paths.js";
 
 export type ChatSession = {
   id: string;
@@ -22,7 +23,22 @@ export type SessionSummary = {
   updatedAt: number;
 };
 
-const dataDir = process.env.DATA_DIR || process.env.CODEX_DATA_DIR || path.join(process.cwd(), ".data");
+export type RecoverableChannelSession = {
+  source: string;
+  chatId: string;
+  sessionId: string;
+  updatedAt: number;
+};
+
+export type TelegramMessageRef = {
+  chatId: string;
+  messageId: number;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: number;
+};
+
+const dataDir = getDataDir();
 fs.mkdirSync(dataDir, { recursive: true });
 
 const dbPath = path.join(dataDir, "chat.db");
@@ -51,6 +67,18 @@ db.exec(`
   );
 
   CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+
+  CREATE TABLE IF NOT EXISTS telegram_message_refs (
+    chat_id     TEXT NOT NULL,
+    message_id  INTEGER NOT NULL,
+    role        TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+    content     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, message_id)
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_telegram_message_refs_chat_created
+  ON telegram_message_refs(chat_id, created_at DESC);
 `);
 
 try {
@@ -113,8 +141,54 @@ const stmts = {
     UPDATE sessions SET chat_id = NULL WHERE source = ? AND chat_id = ?
   `),
 
+  listRecoverableChannelSessions: db.prepare(`
+    SELECT
+      s.source,
+      s.chat_id AS chatId,
+      s.session_id AS sessionId,
+      s.updated_at AS updatedAt
+    FROM sessions s
+    WHERE s.source != 'web'
+      AND s.chat_id IS NOT NULL
+      AND s.chat_id != ''
+      AND s.session_id IS NOT NULL
+      AND s.session_id != ''
+      AND s.id = (
+        SELECT s2.id
+        FROM sessions s2
+        WHERE s2.source = s.source
+          AND s2.chat_id = s.chat_id
+          AND s2.session_id IS NOT NULL
+          AND s2.session_id != ''
+        ORDER BY s2.updated_at DESC, s2.id DESC
+        LIMIT 1
+      )
+    ORDER BY s.updated_at DESC
+  `),
+
   detachAllChannelSessions: db.prepare(`
     UPDATE sessions SET chat_id = NULL WHERE source != 'web' AND chat_id IS NOT NULL
+  `),
+
+  upsertTelegramMessageRef: db.prepare(`
+    INSERT INTO telegram_message_refs (chat_id, message_id, role, content, created_at)
+    VALUES (@chatId, @messageId, @role, @content, @createdAt)
+    ON CONFLICT(chat_id, message_id) DO UPDATE SET
+      role = excluded.role,
+      content = excluded.content,
+      created_at = excluded.created_at
+  `),
+
+  findTelegramMessageRef: db.prepare(`
+    SELECT
+      chat_id AS chatId,
+      message_id AS messageId,
+      role,
+      content,
+      created_at AS createdAt
+    FROM telegram_message_refs
+    WHERE chat_id = ? AND message_id = ?
+    LIMIT 1
   `),
 };
 
@@ -207,10 +281,32 @@ export function detachChatId(source: string, chatId: string): void {
   stmts.detachChatId.run(source, chatId);
 }
 
+export function listRecoverableChannelSessions(): RecoverableChannelSession[] {
+  return stmts.listRecoverableChannelSessions.all() as RecoverableChannelSession[];
+}
+
 export function detachAllChannelSessions(): void {
   stmts.detachAllChannelSessions.run();
 }
 
 export function closeDb(): void {
   db.close();
+}
+
+export function saveTelegramMessageRef(ref: TelegramMessageRef): void {
+  stmts.upsertTelegramMessageRef.run({
+    chatId: ref.chatId,
+    messageId: ref.messageId,
+    role: ref.role,
+    content: ref.content,
+    createdAt: ref.createdAt,
+  });
+}
+
+export function findTelegramMessageRef(
+  chatId: string,
+  messageId: number,
+): TelegramMessageRef | null {
+  const row = stmts.findTelegramMessageRef.get(chatId, messageId) as TelegramMessageRef | undefined;
+  return row || null;
 }

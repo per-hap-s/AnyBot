@@ -1,20 +1,21 @@
 import type { IChannel, ChannelCallbacks } from "./types.js";
 import { readChannelsConfig } from "./config.js";
 import { FeishuChannel } from "./feishu.js";
-import { QQBotChannel } from "./qqbot.js";
 import { TelegramChannel } from "./telegram.js";
 import { logger } from "../logger.js";
 
+const REGISTERED_CHANNEL_TYPES = ["feishu", "telegram"] as const;
+
+type ChannelType = (typeof REGISTERED_CHANNEL_TYPES)[number];
 type ChannelFactory = () => IChannel;
 
-const channelFactories: Record<string, ChannelFactory> = {
+const channelFactories: Record<ChannelType, ChannelFactory> = {
   feishu: () => new FeishuChannel(),
-  qqbot: () => new QQBotChannel(),
   telegram: () => new TelegramChannel(),
 };
 
 export function getRegisteredChannelTypes(): string[] {
-  return Object.keys(channelFactories);
+  return [...REGISTERED_CHANNEL_TYPES];
 }
 
 class ChannelManager {
@@ -26,7 +27,7 @@ class ChannelManager {
     const config = readChannelsConfig();
     const started: IChannel[] = [];
 
-    for (const [type, factory] of Object.entries(channelFactories)) {
+    for (const type of REGISTERED_CHANNEL_TYPES) {
       const channelConfig = config[type];
       if (!channelConfig?.enabled) {
         logger.info("channel.skipped", { type, reason: "disabled" });
@@ -34,7 +35,7 @@ class ChannelManager {
       }
 
       try {
-        const channel = factory();
+        const channel = channelFactories[type]();
         await channel.start(callbacks);
         this.runningChannels.set(type, channel);
         started.push(channel);
@@ -55,6 +56,20 @@ class ChannelManager {
     return Array.from(this.runningChannels.keys());
   }
 
+  async stopAll(): Promise<void> {
+    const entries = Array.from(this.runningChannels.entries());
+    this.runningChannels.clear();
+
+    for (const [type, channel] of entries) {
+      try {
+        await channel.stop();
+        logger.info("channel.stopped", { type });
+      } catch (error) {
+        logger.error("channel.stop_failed", { type, error });
+      }
+    }
+  }
+
   async restartChannel(type: string): Promise<void> {
     if (!this.callbacks) {
       logger.warn("channel.restart_skipped", { type, reason: "no callbacks registered" });
@@ -72,21 +87,19 @@ class ChannelManager {
       this.runningChannels.delete(type);
     }
 
-    const config = readChannelsConfig();
-    const channelConfig = config[type];
-    if (!channelConfig?.enabled) {
-      logger.info("channel.restart.disabled", { type });
-      return;
-    }
-
-    const factory = channelFactories[type];
-    if (!factory) {
+    if (!(type in channelFactories)) {
       logger.warn("channel.restart.unknown_type", { type });
       return;
     }
 
+    const config = readChannelsConfig();
+    if (!config[type as ChannelType]?.enabled) {
+      logger.info("channel.restart.disabled", { type });
+      return;
+    }
+
     try {
-      const channel = factory();
+      const channel = channelFactories[type as ChannelType]();
       await channel.start(this.callbacks);
       this.runningChannels.set(type, channel);
       logger.info("channel.restarted", { type });
@@ -105,4 +118,11 @@ export async function startAllChannels(
 }
 
 export { readChannelsConfig, readChannelConfig, updateChannelConfig } from "./config.js";
-export type { IChannel, ChannelCallbacks, ChannelsConfig, ChannelConfig, FeishuChannelConfig, TelegramChannelConfig } from "./types.js";
+export type {
+  IChannel,
+  ChannelCallbacks,
+  ChannelsConfig,
+  ChannelConfig,
+  FeishuChannelConfig,
+  TelegramChannelConfig,
+} from "./types.js";
