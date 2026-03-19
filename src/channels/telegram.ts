@@ -863,7 +863,10 @@ export class TelegramChannel implements IChannel {
         chatId,
         reply,
         this.workdir,
-        { existingMessage: running.batch.status.currentMessage },
+        {
+          existingMessage: running.batch.status.currentMessage,
+          finalReplyMode: this.config!.finalReplyMode,
+        },
       );
 
       if (state.running?.id !== running.id) {

@@ -24,6 +24,8 @@ import {
   type MenuItemConstructorOptions,
 } from "electron";
 
+import { readChannelConfig, updateChannelConfig } from "../channels/config.js";
+import type { TelegramChannelConfig, TelegramFinalReplyMode } from "../channels/types.js";
 import { CONTROL_TOKEN_HEADER, readControlToken } from "../control-token.js";
 import { getDataDir, getRunDir } from "../runtime-paths.js";
 import type { ServiceStatusPayload } from "../service-status.js";
@@ -66,6 +68,7 @@ const DEFAULT_SERVICE_AUTO_START_DELAY_SECONDS = 0;
 const SUMMARY_MAX_LENGTH = 64;
 const WORKDIR_MAX_LENGTH = 68;
 const ERROR_MAX_LENGTH = 42;
+const DEFAULT_TELEGRAM_FINAL_REPLY_MODE: TelegramFinalReplyMode = "replace";
 const HIDDEN_ARG = "--hidden";
 const START_SERVICE_ARG = "--start-service";
 const WINDOWS_RUN_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -156,6 +159,10 @@ function truncateValue(value: string, max = 54): string {
 
 function formatEnabledLabel(enabled: boolean): string {
   return enabled ? "开" : "关";
+}
+
+function formatTelegramFinalReplyModeLabel(mode: TelegramFinalReplyMode): string {
+  return mode === "replace_and_notify" ? "原地替换并提醒" : "原地替换";
 }
 
 function formatSummary(status: ServiceStatusPayload | null, port: number): string {
@@ -484,6 +491,29 @@ class ServiceManager {
       );
     }
 
+    const telegramFinalReplyMode = this.getTelegramFinalReplyMode();
+    items.push({
+      label: `TG 最终回复：${formatTelegramFinalReplyModeLabel(telegramFinalReplyMode)}`,
+      submenu: [
+        {
+          label: "原地替换",
+          type: "radio",
+          checked: telegramFinalReplyMode === "replace",
+          click: () => {
+            void this.setTelegramFinalReplyMode("replace");
+          },
+        },
+        {
+          label: "原地替换并提醒",
+          type: "radio",
+          checked: telegramFinalReplyMode === "replace_and_notify",
+          click: () => {
+            void this.setTelegramFinalReplyMode("replace_and_notify");
+          },
+        },
+      ],
+    });
+
     if (status?.workdir) {
       items.push({
         label: `工作目录：${truncateValue(status.workdir, WORKDIR_MAX_LENGTH)}`,
@@ -638,6 +668,62 @@ class ServiceManager {
 
   private getServiceAutoStartDelayLabel(): string {
     return `${this.getServiceAutoStartDelaySeconds()} 秒`;
+  }
+
+  private getTelegramFinalReplyMode(): TelegramFinalReplyMode {
+    const config = readChannelConfig<TelegramChannelConfig>("telegram");
+    return config?.finalReplyMode === "replace_and_notify"
+      ? "replace_and_notify"
+      : DEFAULT_TELEGRAM_FINAL_REPLY_MODE;
+  }
+
+  private async setTelegramFinalReplyMode(mode: TelegramFinalReplyMode): Promise<void> {
+    const currentMode = this.getTelegramFinalReplyMode();
+    if (currentMode === mode) {
+      return;
+    }
+
+    const updated = await this.updateTelegramConfig({ finalReplyMode: mode });
+    this.renderTray();
+    if (!updated) {
+      this.notify("AnyBot", "Telegram 最终回复模式更新失败。");
+    }
+  }
+
+  private async updateTelegramConfig(partial: Partial<TelegramChannelConfig>): Promise<boolean> {
+    if (this.state === "running" && this.currentStatus) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+
+      try {
+        const response = await fetch(`${buildServiceUrl(this.port)}/api/channels/telegram`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(partial),
+          signal: controller.signal,
+        });
+        if (response.ok) {
+          return true;
+        }
+      } catch {
+        // Fall back to direct config-file update when the service API is unavailable.
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    try {
+      updateChannelConfig("telegram", partial);
+      return true;
+    } catch (error) {
+      this.logger.log("warn", "tray.telegram_config_update_failed", {
+        error: error instanceof Error ? error.message : String(error),
+        partial,
+      });
+      return false;
+    }
   }
 
   private applyLoginItemSetting(enabled: boolean): void {

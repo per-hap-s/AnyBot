@@ -6,11 +6,14 @@ import { fetch as undiciFetch, FormData } from "undici";
 
 import { parseReplyPayload, sanitizeIncomingFileName } from "./message.js";
 import { logger } from "./logger.js";
+import type { TelegramFinalReplyMode } from "./channels/types.js";
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const TELEGRAM_DOWNLOAD_BASE = "https://api.telegram.org/file";
 const MAX_TELEGRAM_UPLOAD_BYTES = 49 * 1024 * 1024;
 const MAX_TELEGRAM_DRAFT_TEXT_LENGTH = 4096;
+const TELEGRAM_REPLY_REUSED_NOTIFICATION_TEXT = "AnyBot 已在上方更新回复。";
+const TELEGRAM_REPLY_REUSED_NOTIFICATION_TTL_MS = 15_000;
 
 export type TelegramChatType = "private" | "group" | "supergroup" | "channel";
 
@@ -384,6 +387,24 @@ export async function sendTelegramDeleteMessage(
 
 export { sendTelegramDeleteMessage as deleteTelegramMessage };
 
+function scheduleTelegramReminderCleanup(
+  botToken: string,
+  chatId: string | number,
+  messageId: number,
+): void {
+  const timer = setTimeout(() => {
+    void sendTelegramDeleteMessage(botToken, chatId, messageId).catch((error: unknown) => {
+      logger.warn("telegram.reply_reuse_notify_delete_failed", {
+        chatId,
+        messageId,
+        error,
+      });
+    });
+  }, TELEGRAM_REPLY_REUSED_NOTIFICATION_TTL_MS);
+
+  timer.unref?.();
+}
+
 function normalizeTelegramDraftText(text: string): string {
   const normalized = text.trim() || "正在处理…";
   if (normalized.length <= MAX_TELEGRAM_DRAFT_TEXT_LENGTH) {
@@ -566,6 +587,7 @@ export async function commitTelegramReply(
   workdir: string,
   opts?: {
     existingMessage?: TelegramMessage | null;
+    finalReplyMode?: TelegramFinalReplyMode;
   },
 ): Promise<TelegramReplyCommitResult> {
   const payload = parseReplyPayload(reply, workdir);
@@ -590,11 +612,38 @@ export async function commitTelegramReply(
           document: undefined,
         }
       : edited;
-
-    return {
+    const result: TelegramReplyCommitResult = {
       messages: [editedMessage],
       reusedExistingMessage: true,
     };
+
+    if (opts?.finalReplyMode === "replace_and_notify") {
+      sendTelegramMessage(
+        botToken,
+        chatId,
+        TELEGRAM_REPLY_REUSED_NOTIFICATION_TEXT,
+        {
+          clearDraft: true,
+          replyToMessageId: editedMessage.message_id,
+        },
+      )
+        .then((notificationMessage) => {
+          scheduleTelegramReminderCleanup(
+            botToken,
+            chatId,
+            notificationMessage.message_id,
+          );
+        })
+        .catch((error) => {
+          logger.warn("telegram.reply_reuse_notify_failed", {
+            chatId,
+            messageId: editedMessage.message_id,
+            error,
+          });
+        });
+    }
+
+    return result;
   }
 
   if (payload.text) {

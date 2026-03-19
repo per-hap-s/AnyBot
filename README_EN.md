@@ -98,9 +98,9 @@ Windows installer:
 npm run pack:win
 ```
 
-## Feishu Config
+## Channel Config
 
-Channel config is stored in `.data/channels.json`. Only `feishu` is supported:
+Channel config is stored in `.data/channels.json`. Feishu and Telegram are supported:
 
 ```json
 {
@@ -112,11 +112,25 @@ Channel config is stored in `.data/channels.json`. Only `feishu` is supported:
     "botOpenId": "ou_xxx",
     "ackReaction": "OK",
     "ownerChatId": "oc_xxx"
+  },
+  "telegram": {
+    "enabled": true,
+    "botToken": "123456:ABC...",
+    "ownerChatId": "123456789",
+    "privateOnly": true,
+    "allowGroups": false,
+    "pollingTimeoutSeconds": 30,
+    "finalReplyMode": "replace"
   }
 }
 ```
 
-You can also save it from the `Feishu` page in the Web UI.
+`telegram.finalReplyMode` supports:
+
+- `replace`: replace the in-progress status message with the final answer
+- `replace_and_notify`: still replace in place, and also send a short reminder message to trigger a Telegram notification; the reminder auto-deletes after about 15 seconds
+
+You can update this from the Web UI Telegram page or from the Windows tray menu.
 
 ## Environment Variables
 

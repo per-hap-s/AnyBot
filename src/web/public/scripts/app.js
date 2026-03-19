@@ -86,6 +86,7 @@
         privateOnly: document.getElementById("telegram-private-only"),
         allowGroups: document.getElementById("telegram-allow-groups"),
         pollingTimeoutSeconds: document.getElementById("telegram-polling-timeout"),
+        finalReplyMode: document.getElementById("telegram-final-reply-mode"),
         status: document.getElementById("telegram-status"),
         saveBtn: document.getElementById("save-telegram-btn"),
     };
@@ -648,6 +649,9 @@
             : true;
         telegramFields.allowGroups.checked = Boolean(config.allowGroups);
         telegramFields.pollingTimeoutSeconds.value = config.pollingTimeoutSeconds || 30;
+        telegramFields.finalReplyMode.value = config.finalReplyMode === "replace_and_notify"
+            ? "replace_and_notify"
+            : "replace";
         setStatus(telegramFields.status, "", false);
     }
 
@@ -659,6 +663,9 @@
             privateOnly: telegramFields.privateOnly.checked,
             allowGroups: telegramFields.allowGroups.checked,
             pollingTimeoutSeconds: Number(telegramFields.pollingTimeoutSeconds.value) || 30,
+            finalReplyMode: telegramFields.finalReplyMode.value === "replace_and_notify"
+                ? "replace_and_notify"
+                : "replace",
         };
 
         const res = await fetch("/api/channels/telegram", {

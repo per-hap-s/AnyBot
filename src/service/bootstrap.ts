@@ -1,5 +1,7 @@
 import type { Server } from "node:http";
 import { readFileSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +13,7 @@ import { createApp } from "../web/server.js";
 import {
   initProvider,
   getProvider,
+  ProviderTimeoutError,
 } from "../providers/index.js";
 import {
   includeContentInLogs,
@@ -85,6 +88,31 @@ const shouldLogContent = includeContentInLogs();
 const shouldLogPrompt = includePromptInLogs();
 const MAX_CHAT_SESSIONS = 200;
 const WEB_PORT = parseInt(process.env.WEB_PORT || "19981", 10);
+const CODEX_STARTUP_TEXT_TIMEOUT_MS = 60_000;
+const CODEX_STARTUP_RESUME_TIMEOUT_MS = 90_000;
+const CODEX_STARTUP_IMAGE_TIMEOUT_MS = 90_000;
+const CODEX_STARTUP_RETRY_ATTEMPTS = 2;
+const CODEX_PROBE_IMAGE_BASE64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a5W0AAAAASUVORK5CYII=";
+
+type CodexStartupStatus = {
+  label: "正常" | "异常";
+  healthy: boolean;
+  checkedAt: number;
+  passedChecks: string[];
+  detail?: string;
+  checks: {
+    text: CodexCheckStatus;
+    resume: CodexCheckStatus;
+    image: CodexCheckStatus;
+  };
+};
+
+type CodexCheckStatus = {
+  label: "正常" | "异常" | "未检查" | "跳过";
+  healthy: boolean;
+  detail?: string;
+};
 
 class LRUMap<K, V> {
   private map = new Map<K, V>();
@@ -149,6 +177,50 @@ function formatStartupTime(timestamp: number): string {
   }).format(timestamp);
 }
 
+function buildCodexProbePrompt(token: string, mode: "text" | "resume"): string {
+  const instructions = {
+    text: "This is an AnyBot startup self-check for normal text answering.",
+    resume: "This is an AnyBot startup self-check for session resume.",
+  } satisfies Record<"text" | "resume", string>;
+
+  return [
+    instructions[mode],
+    `Reply with exactly ${token}`,
+    "Do not add punctuation, quotes, markdown, code fences, or extra words.",
+  ].join("\n");
+}
+
+function isExpectedProbeReply(text: string, token: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return false;
+  }
+
+  const unfenced = trimmed
+    .replace(/^```(?:\w+)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  const unquoted = unfenced.replace(/^["'`]+|["'`]+$/g, "").trim();
+  return unquoted === token;
+}
+
+function buildCodexImageProbePrompt(token: string): string {
+  return [
+    "This is an AnyBot startup self-check for image transport.",
+    "An image is attached.",
+    "Ignore the image contents.",
+    `Reply with exactly ${token}`,
+    "Do not add punctuation, quotes, markdown, code fences, or extra words.",
+  ].join("\n");
+}
+
+function createPendingCodexCheckStatus(): CodexCheckStatus {
+  return {
+    label: "未检查",
+    healthy: false,
+  };
+}
+
 export class AnyBotService {
   private readonly provider = initProvider(getProviderConfig());
   private readonly controlToken = ensureControlToken();
@@ -159,6 +231,7 @@ export class AnyBotService {
   private startedAt = Date.now();
   private webServer: Server | null = null;
   private shutdownPromise: Promise<void> | null = null;
+  private codexStartupStatus: CodexStartupStatus | null = null;
   private readonly memoryWorker = new MemoryWorker({
     extract_memory: (payload) => this.runExtractMemoryJob(payload),
     embed_memory_entry: (payload) => this.runEmbedMemoryJob(payload),
@@ -721,22 +794,229 @@ export class AnyBotService {
     };
   }
 
-  private buildStartupNotification(channels: IChannel[]): string {
+  private async createCodexProbeImage(): Promise<{ filePath: string; cleanup: () => Promise<void> }> {
+    const dirPath = await mkdtemp(path.join(tmpdir(), "anybot-codex-probe-"));
+    const filePath = path.join(dirPath, "probe.png");
+    await writeFile(filePath, Buffer.from(CODEX_PROBE_IMAGE_BASE64, "base64"));
+    return {
+      filePath,
+      cleanup: () => rm(dirPath, { recursive: true, force: true }),
+    };
+  }
+
+  private async runCodexStartupProbeWithRetry<T>(
+    probe: "resume" | "image",
+    task: () => Promise<T>,
+  ): Promise<T> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= CODEX_STARTUP_RETRY_ATTEMPTS; attempt += 1) {
+      try {
+        return await task();
+      } catch (error) {
+        lastError = error;
+        const isTimeout = error instanceof ProviderTimeoutError;
+        const shouldRetry = isTimeout && attempt < CODEX_STARTUP_RETRY_ATTEMPTS;
+        if (!shouldRetry) {
+          throw error;
+        }
+
+        logger.warn("provider.startup_check.retrying", {
+          provider: this.provider.type,
+          model: getCurrentModel(),
+          probe,
+          attempt,
+          maxAttempts: CODEX_STARTUP_RETRY_ATTEMPTS,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+
+    throw lastError instanceof Error
+      ? lastError
+      : new Error(`Unexpected ${probe} startup probe failure`);
+  }
+
+  private async runCodexStartupChecks(): Promise<CodexStartupStatus> {
+    const passedChecks: string[] = [];
+    const checks: CodexStartupStatus["checks"] = {
+      text: createPendingCodexCheckStatus(),
+      resume: createPendingCodexCheckStatus(),
+      image: createPendingCodexCheckStatus(),
+    };
+    const baseRunOptions = {
+      workdir: getWorkdir(),
+      sandbox: getSandbox(),
+      model: getCurrentModel(),
+    };
+
+    try {
+      const textToken = `ANYBOT_TEXT_OK_${generateId().slice(0, 8)}`;
+      const textResult = await this.provider.run({
+        ...baseRunOptions,
+        timeoutMs: CODEX_STARTUP_TEXT_TIMEOUT_MS,
+        prompt: buildCodexProbePrompt(textToken, "text"),
+      });
+      if (!isExpectedProbeReply(textResult.text, textToken)) {
+        throw new Error("text self-check returned unexpected output");
+      }
+      checks.text = {
+        label: "正常",
+        healthy: true,
+      };
+      passedChecks.push("text");
+
+      if (this.provider.capabilities.sessionResume) {
+        if (!textResult.sessionId) {
+          throw new Error("text self-check did not return a session id");
+        }
+
+        const resumeToken = `ANYBOT_RESUME_OK_${generateId().slice(0, 8)}`;
+        const resumeResult = await this.runCodexStartupProbeWithRetry("resume", () => this.provider.run({
+          ...baseRunOptions,
+          timeoutMs: CODEX_STARTUP_RESUME_TIMEOUT_MS,
+          prompt: buildCodexProbePrompt(resumeToken, "resume"),
+          sessionId: textResult.sessionId || undefined,
+        }));
+        if (!isExpectedProbeReply(resumeResult.text, resumeToken)) {
+          throw new Error("resume self-check returned unexpected output");
+        }
+        checks.resume = {
+          label: "正常",
+          healthy: true,
+        };
+        passedChecks.push("resume");
+      } else {
+        checks.resume = {
+          label: "跳过",
+          healthy: true,
+          detail: "provider does not support session resume",
+        };
+      }
+
+      if (this.provider.capabilities.imageInput) {
+        const probeImage = await this.createCodexProbeImage();
+        try {
+          const imageToken = `ANYBOT_IMAGE_OK_${generateId().slice(0, 8)}`;
+          const imageResult = await this.runCodexStartupProbeWithRetry("image", () => this.provider.run({
+            ...baseRunOptions,
+            timeoutMs: CODEX_STARTUP_IMAGE_TIMEOUT_MS,
+            prompt: buildCodexImageProbePrompt(imageToken),
+            imagePaths: [probeImage.filePath],
+          }));
+          if (!isExpectedProbeReply(imageResult.text, imageToken)) {
+            throw new Error("image transport self-check returned unexpected output");
+          }
+          checks.image = {
+            label: "正常",
+            healthy: true,
+          };
+          passedChecks.push("image");
+        } finally {
+          await probeImage.cleanup();
+        }
+      } else {
+        checks.image = {
+          label: "跳过",
+          healthy: true,
+          detail: "provider does not support image input",
+        };
+      }
+
+      const status: CodexStartupStatus = {
+        label: "正常",
+        healthy: true,
+        checkedAt: Date.now(),
+        passedChecks,
+        checks,
+      };
+      this.codexStartupStatus = status;
+      logger.info("provider.startup_check.passed", {
+        provider: this.provider.type,
+        model: getCurrentModel(),
+        passedChecks,
+      });
+      return status;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (checks.text.label === "未检查") {
+        checks.text = {
+          label: "异常",
+          healthy: false,
+          detail,
+        };
+      } else if (checks.resume.label === "未检查" && this.provider.capabilities.sessionResume) {
+        checks.resume = {
+          label: "异常",
+          healthy: false,
+          detail,
+        };
+      } else if (checks.image.label === "未检查" && this.provider.capabilities.imageInput) {
+        checks.image = {
+          label: "异常",
+          healthy: false,
+          detail,
+        };
+      }
+      const status: CodexStartupStatus = {
+        label: "异常",
+        healthy: false,
+        checkedAt: Date.now(),
+        passedChecks,
+        detail,
+        checks,
+      };
+      this.codexStartupStatus = status;
+      logger.warn("provider.startup_check.failed", {
+        provider: this.provider.type,
+        model: getCurrentModel(),
+        passedChecks,
+        detail,
+      });
+      return status;
+    }
+  }
+
+  private buildStartupNotification(
+    channels: IChannel[],
+    codexStatus: CodexStartupStatus,
+  ): string {
     const activeChannels = channels.map((channel) => channel.type).join(", ") || "none";
-    return [
+    const lines = [
       "AnyBot 已上线。",
       `时间：${formatStartupTime(this.startedAt)}`,
       `模型：${getCurrentModel()}`,
       `通道：${activeChannels}`,
-    ].join("\n");
+      `codex：${codexStatus.label}`,
+      `codex文本：${codexStatus.checks.text.label}`,
+      `codex续聊：${codexStatus.checks.resume.label}`,
+      `codex图片通道：${codexStatus.checks.image.label}`,
+    ];
+
+    if (codexStatus.checks.text.label === "异常" && codexStatus.checks.text.detail) {
+      lines.push(`codex文本详情：${codexStatus.checks.text.detail}`);
+    }
+    if (codexStatus.checks.resume.label === "异常" && codexStatus.checks.resume.detail) {
+      lines.push(`codex续聊详情：${codexStatus.checks.resume.detail}`);
+    }
+    if (codexStatus.checks.image.label === "异常" && codexStatus.checks.image.detail) {
+      lines.push(`codex图片通道详情：${codexStatus.checks.image.detail}`);
+    } else if (!codexStatus.healthy && codexStatus.detail) {
+      lines.push(`codex详情：${codexStatus.detail}`);
+    }
+
+    return lines.join("\n");
   }
 
-  private async notifyOwnersServiceStarted(channels: IChannel[]): Promise<void> {
+  private async notifyOwnersServiceStarted(
+    channels: IChannel[],
+    codexStatus: CodexStartupStatus,
+  ): Promise<void> {
     if (channels.length === 0) {
       return;
     }
 
-    const message = this.buildStartupNotification(channels);
+    const message = this.buildStartupNotification(channels, codexStatus);
     await Promise.all(channels.map(async (channel) => {
       try {
         await channel.sendToOwner(message);
@@ -773,17 +1053,6 @@ export class AnyBotService {
     });
 
     this.hydrateChannelSessions();
-    const recoveredJobs = recoverRunningMemoryJobs();
-    if (recoveredJobs > 0) {
-      logger.warn("memory.jobs.recovered_running", {
-        count: recoveredJobs,
-      });
-    }
-    this.memoryWorker.start();
-    if (db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE).length > 0) {
-      enqueuePromotionJob(OWNER_PRIVATE_MEMORY_SCOPE, `startup:${this.startedAt}`);
-    }
-    this.enqueueCanonicalEmbeddingBackfill(OWNER_PRIVATE_MEMORY_SCOPE);
 
     const channelCallbacks: ChannelCallbacks = {
       generateReply: (chatId, userText, imagePaths, source, onEvent, signal) =>
@@ -818,10 +1087,31 @@ export class AnyBotService {
     });
 
     const channels = await startAllChannels(channelCallbacks);
+    const codexStartupStatus = await this.runCodexStartupChecks();
     logger.info("service.started", {
       activeChannels: channels.map((c) => c.type),
+      codexStatus: codexStartupStatus.label,
+      codexPassedChecks: codexStartupStatus.passedChecks,
+      codexChecks: {
+        text: codexStartupStatus.checks.text.label,
+        resume: codexStartupStatus.checks.resume.label,
+        image: codexStartupStatus.checks.image.label,
+      },
+      ...(codexStartupStatus.detail ? { codexDetail: codexStartupStatus.detail } : {}),
     });
-    await this.notifyOwnersServiceStarted(channels);
+    await this.notifyOwnersServiceStarted(channels, codexStartupStatus);
+
+    const recoveredJobs = recoverRunningMemoryJobs();
+    if (recoveredJobs > 0) {
+      logger.warn("memory.jobs.recovered_running", {
+        count: recoveredJobs,
+      });
+    }
+    this.memoryWorker.start();
+    if (db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE).length > 0) {
+      enqueuePromotionJob(OWNER_PRIVATE_MEMORY_SCOPE, `startup:${this.startedAt}`);
+    }
+    this.enqueueCanonicalEmbeddingBackfill(OWNER_PRIVATE_MEMORY_SCOPE);
   }
 
   async shutdown(reason: string): Promise<void> {

@@ -14,11 +14,14 @@ export interface FeishuChannelConfig extends ChannelConfig {
   ackReaction: string;
 }
 
+export type TelegramFinalReplyMode = "replace" | "replace_and_notify";
+
 export interface TelegramChannelConfig extends ChannelConfig {
   botToken: string;
   privateOnly: boolean;
   allowGroups: boolean;
   pollingTimeoutSeconds: number;
+  finalReplyMode: TelegramFinalReplyMode;
 }
 
 export interface ChannelsConfig {

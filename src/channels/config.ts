@@ -5,6 +5,7 @@ import type {
   ChannelsConfig,
   FeishuChannelConfig,
   TelegramChannelConfig,
+  TelegramFinalReplyMode,
 } from "./types.js";
 import { getDataDir } from "../runtime-paths.js";
 
@@ -27,8 +28,13 @@ const DEFAULT_CONFIG: ChannelsConfig = {
     privateOnly: true,
     allowGroups: false,
     pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
   } satisfies TelegramChannelConfig,
 };
+
+function normalizeTelegramFinalReplyMode(value: unknown): TelegramFinalReplyMode {
+  return value === "replace_and_notify" ? "replace_and_notify" : "replace";
+}
 
 function ensureConfig(): void {
   const dir = path.dirname(CONFIG_PATH);
@@ -89,6 +95,7 @@ export function readChannelsConfig(): ChannelsConfig {
         telegram.pollingTimeoutSeconds > 0
           ? Math.min(Math.max(Math.round(telegram.pollingTimeoutSeconds), 1), 50)
           : DEFAULT_CONFIG.telegram!.pollingTimeoutSeconds,
+      finalReplyMode: normalizeTelegramFinalReplyMode(telegram.finalReplyMode),
     } satisfies TelegramChannelConfig,
   };
 }
@@ -139,6 +146,13 @@ export function updateChannelConfig(
       ...(partial ?? {}),
     } as TelegramChannelConfig;
   }
-  writeChannelsConfig(nextConfig);
-  return nextConfig;
+  const normalized = {
+    ...nextConfig,
+    telegram: {
+      ...nextConfig.telegram,
+      finalReplyMode: normalizeTelegramFinalReplyMode(nextConfig.telegram?.finalReplyMode),
+    } as TelegramChannelConfig,
+  } satisfies ChannelsConfig;
+  writeChannelsConfig(normalized);
+  return normalized;
 }

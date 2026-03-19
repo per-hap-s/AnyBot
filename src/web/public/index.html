@@ -137,6 +137,14 @@
                 <input id="telegram-polling-timeout" type="number" min="1" max="50" placeholder="30">
             </label>
 
+            <label class="field">
+                <span>最终回复模式</span>
+                <select id="telegram-final-reply-mode">
+                    <option value="replace">原地替换</option>
+                    <option value="replace_and_notify">原地替换并提醒</option>
+                </select>
+            </label>
+
             <div class="actions">
                 <button id="save-telegram-btn" class="primary-btn">保存 Telegram 配置</button>
                 <div id="telegram-status" class="status"></div>

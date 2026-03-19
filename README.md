@@ -88,9 +88,9 @@ npm run start:tray
 npm run pack:win
 ```
 
-## 飞书配置
+## 频道配置
 
-飞书配置保存在 `.data/channels.json`，当前只支持 `feishu`：
+频道配置保存在 `.data/channels.json`，当前支持 `feishu` 和 `telegram`：
 
 ```json
 {
@@ -102,11 +102,25 @@ npm run pack:win
     "botOpenId": "ou_xxx",
     "ackReaction": "OK",
     "ownerChatId": "oc_xxx"
+  },
+  "telegram": {
+    "enabled": true,
+    "botToken": "123456:ABC...",
+    "ownerChatId": "123456789",
+    "privateOnly": true,
+    "allowGroups": false,
+    "pollingTimeoutSeconds": 30,
+    "finalReplyMode": "replace"
   }
 }
 ```
 
-也可以在 Web UI 的 `Feishu` 页面中直接保存。
+`telegram.finalReplyMode` 支持：
+
+- `replace`：最终回答直接替换状态消息
+- `replace_and_notify`：最终回答仍然原地替换，同时额外发送一条短提醒消息以触发 Telegram 提醒；该提醒会在约 15 秒后自动删除
+
+也可以在 Web UI 的 `Telegram` 页面和 Windows 托盘菜单中直接修改。
 
 ## 环境变量
 
