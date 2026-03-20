@@ -11,6 +11,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } fr
 import net from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
 
 import {
   app,
@@ -78,8 +79,24 @@ const WINDOWS_LEGACY_LOGIN_ITEM_NAMES = ["electron.app.Electron", "AnyBot"];
 let trayInstance: Tray | null = null;
 let serviceManagerInstance: ServiceManager | null = null;
 
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const FALLBACK_APP_ROOT = path.resolve(MODULE_DIR, "..", "..", "..");
+
+function getAppRoot(): string {
+  try {
+    const electronAppPath = app.getAppPath();
+    if (existsSync(path.join(electronAppPath, "package.json"))) {
+      return electronAppPath;
+    }
+  } catch {
+    // Fall back to the current module path when Electron has not resolved the app root yet.
+  }
+
+  return FALLBACK_APP_ROOT;
+}
+
 function getRuntimeRoot(): string {
-  return app.isPackaged ? app.getPath("userData") : app.getAppPath();
+  return app.isPackaged ? app.getPath("userData") : getAppRoot();
 }
 
 function getTrayConfigPath(runtimeRoot: string): string {
@@ -150,7 +167,7 @@ function buildServiceUrl(port: number): string {
 }
 
 function getTrayIconPath(state: ServiceState): string {
-  return path.join(app.getAppPath(), "assets", "icons", `tray-${state}.ico`);
+  return path.join(getAppRoot(), "assets", "icons", `tray-${state}.ico`);
 }
 
 function truncateValue(value: string, max = 54): string {
@@ -220,7 +237,7 @@ function getLaunchContext(): TrayLaunchContext {
 }
 
 function buildLoginItemSettings(enabled?: boolean): LoginItemSettingsOptions {
-  const loginArgs = app.isPackaged ? [HIDDEN_ARG] : [app.getAppPath(), HIDDEN_ARG];
+  const loginArgs = app.isPackaged ? [HIDDEN_ARG] : [getAppRoot(), HIDDEN_ARG];
   return {
     ...(enabled === undefined ? {} : { openAtLogin: enabled, openAsHidden: true }),
     path: process.execPath,
@@ -231,7 +248,7 @@ function buildLoginItemSettings(enabled?: boolean): LoginItemSettingsOptions {
 function buildWindowsLoginCommand(): string {
   const segments = [`"${process.execPath}"`];
   if (!app.isPackaged) {
-    segments.push(`"${app.getAppPath()}"`);
+    segments.push(`"${getAppRoot()}"`);
   }
   segments.push(HIDDEN_ARG);
   return segments.join(" ");
@@ -1242,7 +1259,7 @@ async function bootstrap(): Promise<void> {
 
   trayInstance = new Tray(createTrayImage("starting"));
   serviceManagerInstance = new ServiceManager(
-    app.getAppPath(),
+    getAppRoot(),
     runtimeRoot,
     logger,
     DEFAULT_PORT,
