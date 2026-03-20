@@ -29,6 +29,13 @@ import {
   findTelegramMessageRef,
   saveTelegramMessageRef,
 } from "../web/db.js";
+import {
+  getTelegramStatusPhaseRank,
+  mapProviderEventToTelegramStatus,
+  TELEGRAM_RECEIVED_STATUS_TEXT,
+  TELEGRAM_SENDING_STATUS_TEXT,
+  TELEGRAM_STATUS_UPDATE_THROTTLE_MS,
+} from "./telegram-status.js";
 
 const MAX_HANDLED_UPDATE_IDS = 5000;
 const CHAT_ACTION_REFRESH_MS = 4000;
@@ -38,9 +45,6 @@ const SUPPLEMENT_STATUS_TEXT = "已按“补充当前任务”处理";
 const SUPPLEMENT_TIMEOUT_TEXT = "未选择，已默认按“补充当前任务”处理";
 const SUPPLEMENT_RUNNING_TEXT = "正在重新整理你的问题…";
 const QUEUED_STATUS_TEXT = "排队中…";
-const RUNNING_STATUS_TEXT = "正在理解你的问题…";
-const FINALIZING_STATUS_TEXT = "正在整理回答…";
-const SENDING_STATUS_TEXT = "正在发送回复…";
 const STALE_DECISION_TEXT = "该选项已失效";
 const CALLBACK_PREFIX = "tgd";
 
@@ -63,6 +67,8 @@ interface RunningTask {
   batch: PendingBatch;
   abortController: AbortController;
   generation: number;
+  startText: string;
+  runtimeStatusTracker: TelegramRuntimeStatusTracker;
 }
 
 interface PendingDecision {
@@ -84,6 +90,18 @@ interface ChatState {
   pendingRestart: PendingRestart | null;
   generation: number;
 }
+
+type StatusMessageTransport = {
+  send: typeof sendTelegramMessage;
+  edit: typeof editTelegramMessageText;
+  delete: typeof deleteTelegramMessage;
+};
+
+const defaultStatusMessageTransport: StatusMessageTransport = {
+  send: sendTelegramMessage,
+  edit: editTelegramMessageText,
+  delete: deleteTelegramMessage,
+};
 
 class CappedSet<T> {
   private set = new Set<T>();
@@ -110,13 +128,18 @@ class CappedSet<T> {
   }
 }
 
-class StatusMessageController {
+export class StatusMessageController {
   private statusMessage: TelegramMessage | null = null;
+  private currentText: string | null = null;
+  private currentReplyMarkupKey: string | null = null;
+  private operationQueue: Promise<void> = Promise.resolve();
+  private sealed = false;
 
   constructor(
     private readonly botToken: string,
     private readonly chatId: number,
     private readonly replyToMessageId: number,
+    private readonly transport: StatusMessageTransport = defaultStatusMessageTransport,
   ) {}
 
   get messageId(): number | null {
@@ -127,6 +150,10 @@ class StatusMessageController {
     return this.statusMessage;
   }
 
+  get isSealed(): boolean {
+    return this.sealed;
+  }
+
   async show(
     text: string,
     opts?: {
@@ -135,31 +162,51 @@ class StatusMessageController {
     },
   ): Promise<void> {
     const replyMarkup = opts?.clearKeyboard ? { inline_keyboard: [] } : opts?.replyMarkup;
+    const replyMarkupKey = JSON.stringify(replyMarkup ?? null);
 
-    if (!this.statusMessage) {
-      this.statusMessage = await sendTelegramMessage(this.botToken, this.chatId, text, {
-        replyToMessageId: this.replyToMessageId,
-        replyMarkup,
-      });
+    if (this.sealed) {
       return;
     }
 
-    await editTelegramMessageText(
-      this.botToken,
-      this.chatId,
-      this.statusMessage.message_id,
-      text,
-      replyMarkup ? { replyMarkup } : undefined,
-    );
+    this.operationQueue = this.operationQueue.catch(() => {}).then(async () => {
+      if (this.sealed) {
+        return;
+      }
+      if (this.currentText === text && this.currentReplyMarkupKey === replyMarkupKey) {
+        return;
+      }
+
+      if (!this.statusMessage) {
+        this.statusMessage = await this.transport.send(this.botToken, this.chatId, text, {
+          replyToMessageId: this.replyToMessageId,
+          replyMarkup,
+        });
+      } else {
+        await this.transport.edit(
+          this.botToken,
+          this.chatId,
+          this.statusMessage.message_id,
+          text,
+          replyMarkup ? { replyMarkup } : undefined,
+        );
+      }
+
+      this.currentText = text;
+      this.currentReplyMarkupKey = replyMarkupKey;
+    });
+
+    return this.operationQueue;
   }
 
   async delete(): Promise<void> {
+    this.sealed = true;
+    await this.operationQueue.catch(() => {});
     if (!this.statusMessage) {
       return;
     }
 
     try {
-      await deleteTelegramMessage(this.botToken, this.chatId, this.statusMessage.message_id);
+      await this.transport.delete(this.botToken, this.chatId, this.statusMessage.message_id);
     } catch (error) {
       logger.warn("telegram.status.delete_failed", {
         chatId: this.chatId,
@@ -168,7 +215,152 @@ class StatusMessageController {
       });
     } finally {
       this.statusMessage = null;
+      this.currentText = null;
+      this.currentReplyMarkupKey = null;
     }
+  }
+}
+
+type RuntimeStatusTarget = Pick<StatusMessageController, "show">;
+
+export class TelegramRuntimeStatusTracker {
+  private currentPhase: number = getTelegramStatusPhaseRank("received");
+  private currentText: string | null = null;
+  private lastRenderedAt = 0;
+  private pendingStatus: { phaseRank: number; text: string } | null = null;
+  private timer: NodeJS.Timeout | null = null;
+  private flushPromise: Promise<void> | null = null;
+  private disposed = false;
+
+  constructor(
+    private readonly status: RuntimeStatusTarget,
+    private readonly isActive: () => boolean,
+    private readonly throttleMs: number = TELEGRAM_STATUS_UPDATE_THROTTLE_MS,
+  ) {}
+
+  prime(text: string): void {
+    if (this.disposed) {
+      return;
+    }
+    this.currentPhase = getTelegramStatusPhaseRank("received");
+    this.currentText = text;
+    this.lastRenderedAt = Date.now();
+  }
+
+  handleProviderEvent(event: ProviderRuntimeEvent): void {
+    const nextStatus = mapProviderEventToTelegramStatus(event);
+    if (!nextStatus || this.isStopped()) {
+      return;
+    }
+
+    this.enqueue(nextStatus.text, getTelegramStatusPhaseRank(nextStatus.phase));
+  }
+
+  async showSending(): Promise<void> {
+    await this.showImmediate(TELEGRAM_SENDING_STATUS_TEXT, getTelegramStatusPhaseRank("sending"));
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.clearPendingState();
+  }
+
+  private enqueue(text: string, phaseRank: number): void {
+    if (phaseRank < this.currentPhase) {
+      return;
+    }
+    if (phaseRank === this.currentPhase && text === this.currentText) {
+      return;
+    }
+
+    this.pendingStatus = { phaseRank, text };
+    this.schedule();
+  }
+
+  private schedule(): void {
+    if (!this.pendingStatus || this.isStopped()) {
+      return;
+    }
+
+    if (this.flushPromise) {
+      return;
+    }
+
+    const waitMs = Math.max(
+      0,
+      this.throttleMs - (Date.now() - this.lastRenderedAt),
+    );
+
+    if (waitMs === 0) {
+      this.flushPending();
+      return;
+    }
+
+    if (this.timer) {
+      return;
+    }
+
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.flushPending();
+    }, waitMs);
+  }
+
+  private async showImmediate(text: string, phaseRank: number): Promise<void> {
+    if (phaseRank < this.currentPhase || this.isStopped()) {
+      return;
+    }
+    if (phaseRank === this.currentPhase && text === this.currentText) {
+      return;
+    }
+
+    this.clearPendingState();
+    await this.render(text, phaseRank);
+  }
+
+  private flushPending(): void {
+    if (!this.pendingStatus || this.isStopped()) {
+      return;
+    }
+
+    const pendingStatus = this.pendingStatus;
+    this.pendingStatus = null;
+    this.flushPromise = this.render(pendingStatus.text, pendingStatus.phaseRank)
+      .catch((error) => {
+        logger.warn("telegram.status.runtime_update_failed", { error });
+      })
+      .finally(() => {
+        this.flushPromise = null;
+        if (this.pendingStatus && !this.disposed) {
+          this.schedule();
+        }
+      });
+  }
+
+  private async render(text: string, phaseRank: number): Promise<void> {
+    if (this.isStopped()) {
+      return;
+    }
+
+    await this.status.show(text);
+    if (this.isStopped()) {
+      return;
+    }
+    this.currentPhase = Math.max(this.currentPhase, phaseRank);
+    this.currentText = text;
+    this.lastRenderedAt = Date.now();
+  }
+
+  private clearPendingState(): void {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.pendingStatus = null;
+  }
+
+  private isStopped(): boolean {
+    return this.disposed || !this.isActive();
   }
 }
 
@@ -309,10 +501,6 @@ function persistTelegramAssistantReply(
   }
 }
 
-function shouldSwitchToFinalizingStatus(event: ProviderRuntimeEvent): boolean {
-  return event.type === "item.completed" && event.itemType === "agent_message";
-}
-
 function buildDecisionId(): string {
   return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -408,6 +596,37 @@ function isResetCommand(text: string): boolean {
   return trimmed === "/new" || trimmed === "/reset" || trimmed === "/start";
 }
 
+export async function cleanupTelegramChatState(state: ChatState): Promise<void> {
+  const cleanupTasks: Promise<void>[] = [];
+
+  if (state.decision) {
+    state.decision.timer && clearTimeout(state.decision.timer);
+    cleanupTasks.push(state.decision.batch.status.delete());
+    state.decision = null;
+  }
+
+  if (state.running) {
+    state.running.runtimeStatusTracker.dispose();
+    state.running.abortController.abort();
+    cleanupTasks.push(state.running.batch.status.delete());
+    state.running = null;
+  }
+
+  if (state.pendingRestart) {
+    cleanupTasks.push(state.pendingRestart.batch.status.delete());
+    state.pendingRestart = null;
+  }
+
+  for (const queued of state.queued) {
+    cleanupTasks.push(queued.status.delete());
+  }
+  state.queued = [];
+
+  if (cleanupTasks.length > 0) {
+    await Promise.allSettled(cleanupTasks);
+  }
+}
+
 export class TelegramChannel implements IChannel {
   readonly type = "telegram";
 
@@ -450,15 +669,19 @@ export class TelegramChannel implements IChannel {
     this.pollAbortController?.abort();
     this.pollAbortController = null;
 
+    const cleanupTasks: Promise<void>[] = [];
     for (const state of this.chatStates.values()) {
-      state.decision?.timer && clearTimeout(state.decision.timer);
-      state.running?.abortController.abort();
+      cleanupTasks.push(cleanupTelegramChatState(state));
     }
 
     try {
       await this.pollLoopPromise;
     } catch {
       // Ignore polling shutdown errors.
+    }
+
+    if (cleanupTasks.length > 0) {
+      await Promise.allSettled(cleanupTasks);
     }
 
     this.chatStates.clear();
@@ -631,7 +854,7 @@ export class TelegramChannel implements IChannel {
 
     if (!state.running) {
       const batch = this.createBatch(botToken, message, [item]);
-      await this.startBatch(chatId, state, batch, RUNNING_STATUS_TEXT);
+      await this.startBatch(chatId, state, batch, TELEGRAM_RECEIVED_STATUS_TEXT);
       return;
     }
 
@@ -775,6 +998,7 @@ export class TelegramChannel implements IChannel {
       combinedItemCount: mergedBatch.items.length,
     };
 
+    running.runtimeStatusTracker.dispose();
     await running.batch.status.delete();
     running.abortController.abort();
   }
@@ -790,11 +1014,21 @@ export class TelegramChannel implements IChannel {
     }
 
     state.generation += 1;
-    const running: RunningTask = {
+    let running: RunningTask;
+    const runtimeStatusTracker = new TelegramRuntimeStatusTracker(
+      batch.status,
+      () =>
+        state.running?.id === running.id
+        && state.running?.generation === running.generation
+        && !running.abortController.signal.aborted,
+    );
+    running = {
       id: buildDecisionId(),
       batch,
       abortController: new AbortController(),
       generation: state.generation,
+      startText,
+      runtimeStatusTracker,
     };
     state.running = running;
 
@@ -821,6 +1055,7 @@ export class TelegramChannel implements IChannel {
 
     const botToken = this.config!.botToken;
     const cleanupDirs = new Set<string>();
+    const runtimeStatusTracker = running.runtimeStatusTracker;
     const stopTypingIndicator = startTypingIndicatorLoop(
       botToken,
       chatId,
@@ -829,18 +1064,9 @@ export class TelegramChannel implements IChannel {
 
     try {
       const prepared = await this.prepareBatchInput(botToken, running.batch, cleanupDirs);
-      let finalizingStatusSent = false;
+      runtimeStatusTracker.prime(running.startText);
       const handleProviderEvent = (event: ProviderRuntimeEvent) => {
-        if (
-          state.running?.id !== running.id
-          || finalizingStatusSent
-          || !shouldSwitchToFinalizingStatus(event)
-        ) {
-          return;
-        }
-
-        finalizingStatusSent = true;
-        void running.batch.status.show(FINALIZING_STATUS_TEXT);
+        runtimeStatusTracker.handleProviderEvent(event);
       };
 
       const reply = await this.callbacks!.generateReply(
@@ -857,7 +1083,7 @@ export class TelegramChannel implements IChannel {
       }
 
       stopTypingIndicator();
-      await running.batch.status.show(SENDING_STATUS_TEXT);
+      await runtimeStatusTracker.showSending();
       const commitResult = await commitTelegramReply(
         botToken,
         chatId,
@@ -894,6 +1120,7 @@ export class TelegramChannel implements IChannel {
         }
       }
     } finally {
+      runtimeStatusTracker.dispose();
       stopTypingIndicator();
 
       for (const cleanupDir of cleanupDirs) {
@@ -942,13 +1169,13 @@ export class TelegramChannel implements IChannel {
         decision.timer = null;
       }
       state.decision = null;
-      await this.startBatch(chatId, state, decision.batch, RUNNING_STATUS_TEXT);
+      await this.startBatch(chatId, state, decision.batch, TELEGRAM_RECEIVED_STATUS_TEXT);
       return;
     }
 
     const nextQueued = state.queued.shift();
     if (nextQueued) {
-      await this.startBatch(chatId, state, nextQueued, RUNNING_STATUS_TEXT);
+      await this.startBatch(chatId, state, nextQueued, TELEGRAM_RECEIVED_STATUS_TEXT);
     }
   }
 
@@ -1054,19 +1281,6 @@ export class TelegramChannel implements IChannel {
   }
 
   private async resetChatState(state: ChatState): Promise<void> {
-    state.decision?.timer && clearTimeout(state.decision.timer);
-    state.decision = null;
-    state.pendingRestart = null;
-
-    if (state.running) {
-      state.running.abortController.abort();
-      await state.running.batch.status.delete();
-      state.running = null;
-    }
-
-    for (const queued of state.queued) {
-      await queued.status.delete();
-    }
-    state.queued = [];
+    await cleanupTelegramChatState(state);
   }
 }

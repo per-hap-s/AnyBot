@@ -35,9 +35,11 @@ export type SandboxMode = (typeof sandboxModes)[number];
 export type CodexJsonEvent = {
   type?: string;
   thread_id?: string;
-  item?: {
+  item?: Record<string, unknown> & {
     id?: string;
     type?: string;
     text?: string;
+    status?: string;
   };
+  [key: string]: unknown;
 };

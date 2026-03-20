@@ -14,6 +14,8 @@ export interface RunOptions {
   sessionId?: string;
   sandbox?: SandboxMode;
   timeoutMs?: number;
+  idleTimeoutMs?: number;
+  maxRuntimeMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: ProviderRuntimeEvent) => void;
 }
@@ -29,11 +31,23 @@ export interface ProviderCapabilities {
   sandbox: boolean;
 }
 
+export type ProviderTimeoutKind = "idle" | "max_runtime";
+
+export type ProviderProgressKind = "progress" | "terminal" | "informational";
+
 export interface ProviderRuntimeEvent {
   type: string;
   threadId?: string;
+  itemId?: string;
   itemType?: string;
+  itemStatus?: string;
   text?: string;
+  command?: string;
+  toolName?: string;
+  query?: string;
+  aggregatedOutputPreview?: string;
+  progressKind?: ProviderProgressKind;
+  raw?: unknown;
 }
 
 export interface ProviderConfig {

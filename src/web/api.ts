@@ -6,6 +6,8 @@ import type { Request, Response } from "express";
 import {
   getProvider,
   ProviderAbortedError,
+  ProviderTimeoutError,
+  shouldRetryFreshSessionAfterTimeout,
   type ProviderRuntimeEvent,
 } from "../providers/index.js";
 import { logger } from "../logger.js";
@@ -174,7 +176,10 @@ function persistUserMessage(
   }
 }
 
-async function buildSessionPrompt(session: db.ChatSession, userText: string): Promise<string> {
+async function buildSessionMemoryContext(
+  session: db.ChatSession,
+  userText: string,
+): Promise<string> {
   const scope = resolveUnifiedPrivateMemoryScope("web", session.id);
   let memoryContext = "";
 
@@ -204,9 +209,20 @@ async function buildSessionPrompt(session: db.ChatSession, userText: string): Pr
     }
   }
 
-  return session.sessionId
+  return memoryContext;
+}
+
+async function buildSessionPrompts(
+  session: db.ChatSession,
+  userText: string,
+): Promise<{ prompt: string; freshPrompt: string }> {
+  const memoryContext = await buildSessionMemoryContext(session, userText);
+  const freshPrompt = buildFirstTurnPrompt(userText, "web", memoryContext);
+  const prompt = session.sessionId
     ? buildResumePrompt(userText, "web", memoryContext)
-    : buildFirstTurnPrompt(userText, "web", memoryContext);
+    : freshPrompt;
+
+  return { prompt, freshPrompt };
 }
 
 function startNdjsonStream(res: Response): void {
@@ -507,7 +523,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
 
     const prepared = prepareMessageInput(content, attachments);
     persistUserMessage(session, prepared);
-    const prompt = await buildSessionPrompt(session, prepared.userText);
+    const prompts = await buildSessionPrompts(session, prepared.userText);
 
     try {
       const provider = getProvider();
@@ -520,14 +536,48 @@ export function chatRouter(options: ApiRouterOptions): Router {
         fileCount: prepared.filePaths.length,
       });
 
-      const result = await provider.run({
-        workdir: getWorkdir(),
-        sandbox: getSandbox(),
-        model: getCurrentModel(),
-        prompt,
-        imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
-        sessionId: session.sessionId || undefined,
-      });
+      let result;
+      try {
+        result = await provider.run({
+          workdir: getWorkdir(),
+          sandbox: getSandbox(),
+          model: getCurrentModel(),
+          prompt: prompts.prompt,
+          imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
+          sessionId: session.sessionId || undefined,
+        });
+      } catch (error) {
+        const shouldRetryFresh = Boolean(
+          session.sessionId
+          && shouldRetryFreshSessionAfterTimeout(error),
+        );
+        if (!shouldRetryFresh) {
+          throw error;
+        }
+
+        logger.warn("web.chat.resume_timeout_retrying_fresh", {
+          sessionId: session.id,
+          providerSessionId: session.sessionId,
+          provider: provider.type,
+          timeoutKind: (error as ProviderTimeoutError).kind,
+        });
+
+        session.sessionId = null;
+        db.updateSession({
+          id,
+          title: session.title,
+          sessionId: null,
+          updatedAt: Date.now(),
+        });
+
+        result = await provider.run({
+          workdir: getWorkdir(),
+          sandbox: getSandbox(),
+          model: getCurrentModel(),
+          prompt: prompts.freshPrompt,
+          imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
+        });
+      }
 
       const providerSessionId = result.sessionId || session.sessionId;
       db.addMessage(id, "assistant", result.text);
@@ -589,7 +639,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
 
     const prepared = prepareMessageInput(content, attachments);
     persistUserMessage(session, prepared);
-    const prompt = await buildSessionPrompt(session, prepared.userText);
+    const prompts = await buildSessionPrompts(session, prepared.userText);
     const provider = getProvider();
     const abortController = new AbortController();
     let completed = false;
@@ -625,47 +675,91 @@ export function chatRouter(options: ApiRouterOptions): Router {
         fileCount: prepared.filePaths.length,
       });
 
-      const result = await provider.run({
-        workdir: getWorkdir(),
-        sandbox: getSandbox(),
-        model: getCurrentModel(),
-        prompt,
-        imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
-        sessionId: session.sessionId || undefined,
-        signal: abortController.signal,
-        onEvent: (event: ProviderRuntimeEvent) => {
-          if (event.type === "thread.started") {
-            writeStreamEvent(res, {
-              type: "provider",
-              eventType: event.type,
-              threadId: event.threadId,
-            });
-            writeStreamEvent(res, {
-              type: "status",
-              phase: "running",
-              message: "Codex 会话已建立，正在生成回复...",
-            });
-            return;
-          }
+      let result;
+      const onProviderEvent = (event: ProviderRuntimeEvent) => {
+        if (event.type === "thread.started") {
+          writeStreamEvent(res, {
+            type: "provider",
+            eventType: event.type,
+            threadId: event.threadId,
+          });
+          writeStreamEvent(res, {
+            type: "status",
+            phase: "running",
+            message: "Codex 会话已建立，正在生成回复...",
+          });
+          return;
+        }
 
-          if (event.type === "turn.started") {
-            writeStreamEvent(res, {
-              type: "status",
-              phase: "running",
-              message: "正在生成回复...",
-            });
-            return;
-          }
+        if (event.type === "turn.started") {
+          writeStreamEvent(res, {
+            type: "status",
+            phase: "running",
+            message: "正在生成回复...",
+          });
+          return;
+        }
 
-          if (event.type === "item.completed" && event.itemType === "agent_message") {
-            writeStreamEvent(res, {
-              type: "status",
-              phase: "finalizing",
-              message: "正在整理最终回复...",
-            });
-          }
-        },
-      });
+        if (event.type === "item.completed" && event.itemType === "agent_message") {
+          writeStreamEvent(res, {
+            type: "status",
+            phase: "finalizing",
+            message: "正在整理最终回复...",
+          });
+        }
+      };
+
+      try {
+        result = await provider.run({
+          workdir: getWorkdir(),
+          sandbox: getSandbox(),
+          model: getCurrentModel(),
+          prompt: prompts.prompt,
+          imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
+          sessionId: session.sessionId || undefined,
+          signal: abortController.signal,
+          onEvent: onProviderEvent,
+        });
+      } catch (error) {
+        const shouldRetryFresh = Boolean(
+          session.sessionId
+          && !abortController.signal.aborted
+          && shouldRetryFreshSessionAfterTimeout(error),
+        );
+        if (!shouldRetryFresh) {
+          throw error;
+        }
+
+        logger.warn("web.chat.stream.resume_timeout_retrying_fresh", {
+          sessionId: session.id,
+          providerSessionId: session.sessionId,
+          provider: provider.type,
+          timeoutKind: (error as ProviderTimeoutError).kind,
+        });
+        writeStreamEvent(res, {
+          type: "status",
+          phase: "preparing",
+          message: "续聊会话长时间无进展，正在重试新会话...",
+        });
+
+        session.sessionId = null;
+        db.updateSession({
+          id,
+          title: session.title,
+          sessionId: null,
+          updatedAt: Date.now(),
+        });
+
+        result = await provider.run({
+          workdir: getWorkdir(),
+          sandbox: getSandbox(),
+          model: getCurrentModel(),
+          prompt: prompts.freshPrompt,
+          imagePaths: prepared.imagePaths.length > 0 ? prepared.imagePaths : undefined,
+          signal: abortController.signal,
+          onEvent: onProviderEvent,
+        });
+      }
 
       const providerSessionId = result.sessionId || session.sessionId;
       db.addMessage(id, "assistant", result.text);

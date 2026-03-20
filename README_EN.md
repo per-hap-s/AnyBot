@@ -3,7 +3,7 @@
 This minimized AnyBot build only supports:
 
 - `Codex CLI` as the only provider
-- `Feishu` as the only messaging channel
+- `Feishu` and `Telegram` as messaging channels
 - The built-in `Web UI` for local chat and configuration
 
 The goal of this version is to stay minimal while supporting both:
@@ -17,13 +17,15 @@ The goal of this version is to stay minimal while supporting both:
 - Codex model switching
 - Feishu long-connection messaging
 - Feishu image input and file/image reply upload
+- Telegram private-chat polling, queue/supplement decisions, and final reply replacement
+- Telegram mixed runtime status updates for long-running Codex tasks
 - Local session persistence
 - Proxy configuration and connectivity test
 
 ## What Was Removed
 
 - Gemini / Cursor / Qoder
-- QQ / Telegram
+- QQ
 - Provider switching
 - Skills management UI
 - `setup.sh` and daemon scripts
@@ -131,6 +133,32 @@ Channel config is stored in `.data/channels.json`. Feishu and Telegram are suppo
 - `replace_and_notify`: still replace in place, and also send a short reminder message to trigger a Telegram notification; the reminder auto-deletes after about 15 seconds
 
 You can update this from the Web UI Telegram page or from the Windows tray menu.
+
+## Telegram Runtime Statuses
+
+Telegram now surfaces Codex runtime progress in a mixed status mode. The status message stays concise by default and only adds a short detail when it is useful, such as the command name, tool name, or search query.
+
+Runtime phases:
+
+- `已收到消息`
+- `正在理解问题`
+- `正在执行命令`
+- `正在搜索网页`
+- `正在调用工具`
+- `正在修改文件`
+- `正在整理回复`
+- `正在发送回复`
+
+Status updates are throttled to avoid Telegram edit spam, older task attempts cannot overwrite the current run, and the processing text now follows the latest real activity instead of getting stuck on the first `正在整理回复`.
+
+## Provider Timeout Behavior
+
+Codex runs now use two timeout guards:
+
+- `idleTimeoutMs = 120000`: fail only when there has been no effective provider progress for 120 seconds and there is no active long-running command / web search / MCP tool call / file change step
+- `maxRuntimeMs = 1800000`: absolute 30 minute ceiling for a single provider run
+
+Only `resume` runs that hit the idle timeout before producing any real progress are retried as a fresh session. Long single-step work is protected from idle timeout and falls back to the max runtime guard instead. This V1 implementation does not introduce a durable background queue and does not support mid-run steering of an existing `codex exec --json` process.
 
 ## Environment Variables
 

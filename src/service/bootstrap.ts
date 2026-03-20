@@ -14,6 +14,7 @@ import {
   initProvider,
   getProvider,
   ProviderTimeoutError,
+  shouldRetryFreshSessionAfterTimeout,
 } from "../providers/index.js";
 import {
   includeContentInLogs,
@@ -309,12 +310,13 @@ export class AnyBotService {
     const conversationKey = this.buildConversationKey(source, chatId);
     const dbSession = this.getOrCreateChannelSession(source, chatId);
     const sessionId = this.sessionIdByChat.get(conversationKey) || dbSession.sessionId || null;
-    const sessionGeneration = this.getSessionGeneration(source, chatId);
     const memoryScope = this.buildPrivateMemoryScopeForChat(source, chatId);
     const memoryContext = await this.buildMemoryContextForReply(memoryScope, userText);
+    const freshPrompt = buildFirstTurnPrompt(userText, source, memoryContext);
     const prompt = sessionId
       ? buildResumePrompt(userText, source, memoryContext)
-      : buildFirstTurnPrompt(userText, source, memoryContext);
+      : freshPrompt;
+    let expectedSessionGeneration = this.getSessionGeneration(source, chatId);
 
     db.addMessage(dbSession.id, "user", userText);
 
@@ -336,22 +338,67 @@ export class AnyBotService {
       ...(shouldLogPrompt ? { prompt: rawLogString(prompt) } : {}),
     });
 
-    const result = await getProvider().run({
-      workdir: getWorkdir(),
-      sandbox: getSandbox(),
-      model: getCurrentModel(),
-      prompt,
-      imagePaths,
-      sessionId: sessionId || undefined,
-      signal,
-      onEvent,
-    });
+    let result;
+    try {
+      result = await getProvider().run({
+        workdir: getWorkdir(),
+        sandbox: getSandbox(),
+        model: getCurrentModel(),
+        prompt,
+        imagePaths,
+        sessionId: sessionId || undefined,
+        signal,
+        onEvent,
+      });
+    } catch (error) {
+      const shouldRetryFresh = Boolean(
+        sessionId
+        && !signal?.aborted
+        && shouldRetryFreshSessionAfterTimeout(error),
+      );
+      if (!shouldRetryFresh) {
+        throw error;
+      }
+
+      logger.warn("reply.generate.resume_timeout_retrying_fresh", {
+        chatId,
+        source,
+        provider: getProvider().type,
+        staleSessionId: sessionId,
+        dbSessionId: dbSession.id,
+        timeoutKind: (error as ProviderTimeoutError).kind,
+      });
+
+      this.sessionIdByChat.delete(conversationKey);
+      this.sessionGenerationByChat.set(
+        conversationKey,
+        this.getSessionGeneration(source, chatId) + 1,
+      );
+      expectedSessionGeneration = this.getSessionGeneration(source, chatId);
+      db.updateSession({
+        id: dbSession.id,
+        title: dbSession.title,
+        sessionId: null,
+        updatedAt: Date.now(),
+      });
+      dbSession.sessionId = null;
+
+      result = await getProvider().run({
+        workdir: getWorkdir(),
+        sandbox: getSandbox(),
+        model: getCurrentModel(),
+        prompt: freshPrompt,
+        imagePaths,
+        signal,
+        onEvent,
+      });
+    }
 
     if (signal?.aborted) {
       throw new Error("Reply generation aborted");
     }
 
-    if (result.sessionId && sessionGeneration === this.getSessionGeneration(source, chatId)) {
+    if (result.sessionId && expectedSessionGeneration === this.getSessionGeneration(source, chatId)) {
       this.sessionIdByChat.set(conversationKey, result.sessionId);
     }
 

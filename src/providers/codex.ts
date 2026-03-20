@@ -6,14 +6,31 @@ import type {
   ProviderModel,
   ProviderCapabilities,
   ProviderRuntimeEvent,
+  ProviderTimeoutKind,
 } from "./types.js";
 import type { CodexJsonEvent } from "../types.js";
 import { logger } from "../logger.js";
+import {
+  DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+  DEFAULT_PROVIDER_MAX_RUNTIME_MS,
+  getProviderLongStepKey,
+  isProviderProgressEvent,
+  shouldTriggerProviderIdleTimeout,
+  normalizeProviderRuntimeEvent,
+} from "./runtime.js";
 
 export class ProviderTimeoutError extends Error {
-  constructor(timeoutMs: number) {
-    super(`Provider execution timed out after ${Math.round(timeoutMs / 1000)}s`);
+  readonly kind: ProviderTimeoutKind;
+  readonly timeoutMs: number;
+  readonly hadProgress: boolean;
+
+  constructor(kind: ProviderTimeoutKind, timeoutMs: number, hadProgress: boolean) {
+    const label = kind === "idle" ? "stalled with no progress" : "reached max runtime";
+    super(`Provider execution ${label} after ${Math.round(timeoutMs / 1000)}s`);
     this.name = "ProviderTimeoutError";
+    this.kind = kind;
+    this.timeoutMs = timeoutMs;
+    this.hadProgress = hadProgress;
   }
 }
 
@@ -48,7 +65,23 @@ export class ProviderAbortedError extends Error {
   }
 }
 
-const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+export function shouldRetryFreshSessionAfterTimeout(error: unknown): error is ProviderTimeoutError {
+  return error instanceof ProviderTimeoutError && error.kind === "idle" && !error.hadProgress;
+}
+
+export const PROVIDER_FORCE_KILL_DELAY_MS = 3_000;
+
+export function scheduleProviderForceKill(
+  isClosed: () => boolean,
+  terminate: (signal: NodeJS.Signals) => void,
+  delayMs: number = PROVIDER_FORCE_KILL_DELAY_MS,
+): NodeJS.Timeout {
+  return setTimeout(() => {
+    if (!isClosed()) {
+      terminate("SIGKILL");
+    }
+  }, delayMs);
+}
 
 export class CodexProvider implements IProvider {
   readonly type = "codex";
@@ -80,7 +113,9 @@ export class CodexProvider implements IProvider {
       model,
       imagePaths = [],
       sessionId,
-      timeoutMs = DEFAULT_TIMEOUT_MS,
+      timeoutMs,
+      idleTimeoutMs = DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+      maxRuntimeMs = timeoutMs ?? DEFAULT_PROVIDER_MAX_RUNTIME_MS,
       signal,
       onEvent,
     } = opts;
@@ -122,7 +157,8 @@ export class CodexProvider implements IProvider {
       sessionId: sessionId || null,
       imageCount: imagePaths.length,
       promptChars: prompt.length,
-      timeoutMs,
+      idleTimeoutMs,
+      maxRuntimeMs,
     });
 
     return new Promise((resolve, reject) => {
@@ -136,10 +172,17 @@ export class CodexProvider implements IProvider {
       let stdout = "";
       let stderr = "";
       let stdoutBuffer = "";
-      let killed = false;
       let aborted = false;
+      let closed = false;
       let startedThreadId: string | null = null;
       let lastMessage: string | null = null;
+      let timeoutState: { kind: ProviderTimeoutKind; timeoutMs: number; hadProgress: boolean } | null = null;
+      let sawProgress = false;
+      let lastProgressAt = startedAt;
+      const activeLongStepKeys = new Set<string>();
+      let idleTimer: NodeJS.Timeout | null = null;
+      let maxRuntimeTimer: NodeJS.Timeout | null = null;
+      let forceKillTimer: NodeJS.Timeout | null = null;
 
       const emitEvent = (event: ProviderRuntimeEvent) => {
         try {
@@ -150,6 +193,31 @@ export class CodexProvider implements IProvider {
             error,
           });
         }
+      };
+
+      const clearTimers = () => {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+        if (maxRuntimeTimer) {
+          clearTimeout(maxRuntimeTimer);
+          maxRuntimeTimer = null;
+        }
+        if (forceKillTimer) {
+          clearTimeout(forceKillTimer);
+          forceKillTimer = null;
+        }
+      };
+
+      const scheduleForceKill = () => {
+        if (forceKillTimer || closed) {
+          return;
+        }
+        forceKillTimer = scheduleProviderForceKill(
+          () => closed,
+          terminateChild,
+        );
       };
 
       const terminateChild = (signal: NodeJS.Signals) => {
@@ -169,6 +237,89 @@ export class CodexProvider implements IProvider {
         }
       };
 
+      const triggerTimeout = (kind: ProviderTimeoutKind, limitMs: number) => {
+        if (timeoutState || aborted) {
+          return;
+        }
+        timeoutState = {
+          kind,
+          timeoutMs: limitMs,
+          hadProgress: sawProgress,
+        };
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+        if (maxRuntimeTimer) {
+          clearTimeout(maxRuntimeTimer);
+          maxRuntimeTimer = null;
+        }
+        terminateChild("SIGTERM");
+        scheduleForceKill();
+      };
+
+      const trackLongStep = (event: ProviderRuntimeEvent) => {
+        const longStepKey = getProviderLongStepKey(event);
+        if (!longStepKey) {
+          if (event.type === "turn.completed" || event.type === "turn.failed" || event.type === "error") {
+            activeLongStepKeys.clear();
+          }
+          return;
+        }
+
+        if (event.type === "item.started") {
+          activeLongStepKeys.add(longStepKey);
+          return;
+        }
+
+        if (event.type === "item.completed") {
+          activeLongStepKeys.delete(longStepKey);
+        }
+      };
+
+      const markProgress = () => {
+        sawProgress = true;
+        lastProgressAt = Date.now();
+        resetIdleTimer();
+      };
+
+      const scheduleIdleCheck = (delayMs: number) => {
+        idleTimer = setTimeout(checkIdleTimer, delayMs);
+      };
+
+      const checkIdleTimer = () => {
+        const now = Date.now();
+        if (shouldTriggerProviderIdleTimeout(
+          lastProgressAt,
+          activeLongStepKeys.size,
+          now,
+          idleTimeoutMs,
+        )) {
+          triggerTimeout("idle", idleTimeoutMs);
+          return;
+        }
+
+        if (timeoutState || aborted || closed) {
+          return;
+        }
+
+        const elapsed = now - lastProgressAt;
+        const nextDelay = activeLongStepKeys.size > 0
+          ? idleTimeoutMs
+          : Math.max(1, idleTimeoutMs - elapsed);
+        scheduleIdleCheck(nextDelay);
+      };
+
+      const resetIdleTimer = () => {
+        if (idleTimeoutMs <= 0 || timeoutState || aborted || closed) {
+          return;
+        }
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+        }
+        scheduleIdleCheck(idleTimeoutMs);
+      };
+
       const handleStdoutLine = (line: string) => {
         const trimmed = line.trim();
         if (!trimmed) {
@@ -177,24 +328,25 @@ export class CodexProvider implements IProvider {
 
         try {
           const event = JSON.parse(trimmed) as CodexJsonEvent;
-          if (event.type === "thread.started" && event.thread_id) {
-            startedThreadId = event.thread_id;
+          const normalizedEvent = normalizeProviderRuntimeEvent(event);
+          if (normalizedEvent.type === "thread.started" && normalizedEvent.threadId) {
+            startedThreadId = normalizedEvent.threadId;
           }
 
           if (
-            event.type === "item.completed" &&
-            event.item?.type === "agent_message" &&
-            event.item.text?.trim()
+            normalizedEvent.type === "item.completed" &&
+            normalizedEvent.itemType === "agent_message" &&
+            normalizedEvent.text
           ) {
-            lastMessage = event.item.text.trim();
+            lastMessage = normalizedEvent.text;
           }
 
-          emitEvent({
-            type: event.type || "unknown",
-            threadId: event.thread_id,
-            itemType: event.item?.type,
-            text: event.item?.text,
-          });
+          trackLongStep(normalizedEvent);
+          if (isProviderProgressEvent(normalizedEvent)) {
+            markProgress();
+          }
+
+          emitEvent(normalizedEvent);
         } catch {
           // Ignore non-JSON stdout lines.
         }
@@ -210,15 +362,12 @@ export class CodexProvider implements IProvider {
         }
       };
 
-      const timer = setTimeout(() => {
-        killed = true;
-        terminateChild("SIGTERM");
-        setTimeout(() => {
-          if (!child.killed) {
-            terminateChild("SIGKILL");
-          }
-        }, 3000);
-      }, timeoutMs);
+      if (maxRuntimeMs > 0) {
+        maxRuntimeTimer = setTimeout(() => {
+          triggerTimeout("max_runtime", maxRuntimeMs);
+        }, maxRuntimeMs);
+      }
+      resetIdleTimer();
 
       child.stdout.on("data", (chunk: Buffer) => {
         const text = chunk.toString("utf8");
@@ -236,7 +385,16 @@ export class CodexProvider implements IProvider {
 
       const abortHandler = () => {
         aborted = true;
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+        if (maxRuntimeTimer) {
+          clearTimeout(maxRuntimeTimer);
+          maxRuntimeTimer = null;
+        }
         terminateChild("SIGTERM");
+        scheduleForceKill();
       };
 
       if (signal) {
@@ -248,7 +406,9 @@ export class CodexProvider implements IProvider {
       }
 
       child.on("error", (error) => {
-        clearTimeout(timer);
+        closed = true;
+        activeLongStepKeys.clear();
+        clearTimers();
         signal?.removeEventListener("abort", abortHandler);
         logger.error("provider.exec.spawn_error", {
           provider: this.type,
@@ -271,23 +431,32 @@ export class CodexProvider implements IProvider {
       });
 
       child.on("close", (code) => {
-        clearTimeout(timer);
+        closed = true;
+        activeLongStepKeys.clear();
+        clearTimers();
         signal?.removeEventListener("abort", abortHandler);
         if (stdoutBuffer.trim()) {
           handleStdoutLine(stdoutBuffer);
           stdoutBuffer = "";
         }
 
-        if (killed) {
+        if (timeoutState) {
           logger.warn("provider.exec.timeout", {
             provider: this.type,
             workdir,
             sandbox,
             durationMs: Date.now() - startedAt,
+            timeoutKind: timeoutState.kind,
+            timeoutMs: timeoutState.timeoutMs,
+            hadProgress: timeoutState.hadProgress,
             stdoutChars: stdout.length,
             stderrChars: stderr.length,
           });
-          reject(new ProviderTimeoutError(timeoutMs));
+          reject(new ProviderTimeoutError(
+            timeoutState.kind,
+            timeoutState.timeoutMs,
+            timeoutState.hadProgress,
+          ));
           return;
         }
 
