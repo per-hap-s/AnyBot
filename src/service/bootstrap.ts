@@ -35,6 +35,7 @@ import {
 } from "../channels/index.js";
 import type { ChannelCallbacks, IChannel } from "../channels/index.js";
 import type { ProviderRuntimeEvent } from "../providers/index.js";
+import type { RunResult } from "../providers/index.js";
 import * as db from "../web/db.js";
 import {
   buildFirstTurnPrompt,
@@ -44,6 +45,9 @@ import {
   getWorkdir,
   getSandbox,
 } from "../shared.js";
+import {
+  ensureCompletedUserReply,
+} from "../reply-completion.js";
 import { ensureControlToken } from "../control-token.js";
 import type { ServiceStatusPayload } from "../service-status.js";
 import {
@@ -338,7 +342,7 @@ export class AnyBotService {
       ...(shouldLogPrompt ? { prompt: rawLogString(prompt) } : {}),
     });
 
-    let result;
+    let result: RunResult;
     try {
       result = await getProvider().run({
         workdir: getWorkdir(),
@@ -398,15 +402,62 @@ export class AnyBotService {
       throw new Error("Reply generation aborted");
     }
 
-    if (result.sessionId && expectedSessionGeneration === this.getSessionGeneration(source, chatId)) {
-      this.sessionIdByChat.set(conversationKey, result.sessionId);
+    const continuationSessionIdFallback = result.sessionId
+      || this.sessionIdByChat.get(conversationKey)
+      || dbSession.sessionId
+      || null;
+
+    const completionOutcome = await ensureCompletedUserReply({
+      userText,
+      result,
+      sessionIdFallback: continuationSessionIdFallback,
+      continueRun: async (continuationSessionId, continuationPrompt) => {
+        logger.warn("reply.generate.incomplete_reply_retrying", {
+          chatId,
+          source,
+          provider: getProvider().type,
+          sessionId: continuationSessionId,
+          dbSessionId: dbSession.id,
+          replyPreview: result.text.slice(0, 120),
+        });
+
+        return getProvider().run({
+          workdir: getWorkdir(),
+          sandbox: getSandbox(),
+          model: getCurrentModel(),
+          prompt: continuationPrompt,
+          sessionId: continuationSessionId,
+          signal,
+          onEvent,
+        });
+      },
+    });
+    result = completionOutcome.result;
+    const effectiveSessionId = result.sessionId
+      || (completionOutcome.repaired ? continuationSessionIdFallback : null)
+      || dbSession.sessionId
+      || null;
+
+    if (completionOutcome.repaired) {
+      logger.info("reply.generate.incomplete_reply_repaired", {
+        chatId,
+        source,
+        provider: getProvider().type,
+        sessionId: effectiveSessionId,
+        dbSessionId: dbSession.id,
+        replyChars: result.text.length,
+      });
+    }
+
+    if (effectiveSessionId && expectedSessionGeneration === this.getSessionGeneration(source, chatId)) {
+      this.sessionIdByChat.set(conversationKey, effectiveSessionId);
     }
 
     db.addMessage(dbSession.id, "assistant", result.text);
     db.updateSession({
       id: dbSession.id,
       title: dbSession.title,
-      sessionId: result.sessionId || dbSession.sessionId,
+      sessionId: effectiveSessionId,
       updatedAt: Date.now(),
     });
 
@@ -414,7 +465,7 @@ export class AnyBotService {
       chatId,
       source,
       provider: getProvider().type,
-      sessionId: result.sessionId,
+      sessionId: effectiveSessionId,
       dbSessionId: dbSession.id,
       replyChars: result.text.length,
       ...(shouldLogContent ? { replyText: rawLogString(result.text) } : {}),
@@ -451,6 +502,7 @@ export class AnyBotService {
           text: hit.text,
           score: Number(hit.score.toFixed(4)),
         })),
+      repairedIncompleteReply: completionOutcome.repaired,
       });
       return buildRelevantMemoryPromptSection(hits, {
         isMemoryQuestion: isMemoryQuestion(userText),

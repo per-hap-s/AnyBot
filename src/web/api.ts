@@ -9,6 +9,7 @@ import {
   ProviderTimeoutError,
   shouldRetryFreshSessionAfterTimeout,
   type ProviderRuntimeEvent,
+  type RunResult,
 } from "../providers/index.js";
 import { logger } from "../logger.js";
 import * as db from "./db.js";
@@ -35,6 +36,7 @@ import {
   getWorkdir,
   getSandbox,
 } from "../shared.js";
+import { ensureCompletedUserReply } from "../reply-completion.js";
 import { CONTROL_TOKEN_HEADER } from "../control-token.js";
 import type { ServiceStatusPayload } from "../service-status.js";
 import {
@@ -536,7 +538,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
         fileCount: prepared.filePaths.length,
       });
 
-      let result;
+      let result: RunResult;
       try {
         result = await provider.run({
           workdir: getWorkdir(),
@@ -579,7 +581,33 @@ export function chatRouter(options: ApiRouterOptions): Router {
         });
       }
 
-      const providerSessionId = result.sessionId || session.sessionId;
+      const continuationSessionIdFallback = result.sessionId || session.sessionId || null;
+      const completionOutcome = await ensureCompletedUserReply({
+        userText: prepared.userText,
+        result,
+        sessionIdFallback: continuationSessionIdFallback,
+        continueRun: async (continuationSessionId, continuationPrompt) => {
+          logger.warn("web.chat.incomplete_reply_retrying", {
+            sessionId: session.id,
+            providerSessionId: continuationSessionId,
+            provider: provider.type,
+            replyPreview: result.text.slice(0, 120),
+          });
+
+          return provider.run({
+            workdir: getWorkdir(),
+            sandbox: getSandbox(),
+            model: getCurrentModel(),
+            prompt: continuationPrompt,
+            sessionId: continuationSessionId,
+          });
+        },
+      });
+      result = completionOutcome.result;
+      const providerSessionId = result.sessionId
+        || (completionOutcome.repaired ? continuationSessionIdFallback : null)
+        || session.sessionId
+        || null;
       db.addMessage(id, "assistant", result.text);
       db.updateSession({
         id,
@@ -601,6 +629,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
           chatId: session.id,
           userText: prepared.userText,
           assistantText: result.text,
+        repairedIncompleteReply: completionOutcome.repaired,
         });
       }
 
@@ -675,7 +704,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
         fileCount: prepared.filePaths.length,
       });
 
-      let result;
+      let result: RunResult;
       const onProviderEvent = (event: ProviderRuntimeEvent) => {
         if (event.type === "thread.started") {
           writeStreamEvent(res, {
@@ -761,7 +790,35 @@ export function chatRouter(options: ApiRouterOptions): Router {
         });
       }
 
-      const providerSessionId = result.sessionId || session.sessionId;
+      const continuationSessionIdFallback = result.sessionId || session.sessionId || null;
+      const completionOutcome = await ensureCompletedUserReply({
+        userText: prepared.userText,
+        result,
+        sessionIdFallback: continuationSessionIdFallback,
+        continueRun: async (continuationSessionId, continuationPrompt) => {
+          logger.warn("web.chat.stream.incomplete_reply_retrying", {
+            sessionId: session.id,
+            providerSessionId: continuationSessionId,
+            provider: provider.type,
+            replyPreview: result.text.slice(0, 120),
+          });
+
+          return provider.run({
+            workdir: getWorkdir(),
+            sandbox: getSandbox(),
+            model: getCurrentModel(),
+            prompt: continuationPrompt,
+            sessionId: continuationSessionId,
+            signal: abortController.signal,
+            onEvent: onProviderEvent,
+          });
+        },
+      });
+      result = completionOutcome.result;
+      const providerSessionId = result.sessionId
+        || (completionOutcome.repaired ? continuationSessionIdFallback : null)
+        || session.sessionId
+        || null;
       db.addMessage(id, "assistant", result.text);
       db.updateSession({
         id,
@@ -783,6 +840,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
           chatId: session.id,
           userText: prepared.userText,
           assistantText: result.text,
+        repairedIncompleteReply: completionOutcome.repaired,
         });
       }
 
