@@ -2,9 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildTelegramCommandStatus,
+  buildTelegramToolStatus,
+  buildTelegramWebStatus,
   getTelegramStatusPhaseRank,
   mapProviderEventToTelegramStatus,
   TELEGRAM_COMMAND_STATUS_TEXT,
+  TELEGRAM_FILE_STATUS_TEXT,
   TELEGRAM_FINALIZING_STATUS_TEXT,
   TELEGRAM_RUNNING_STATUS_TEXT,
   TELEGRAM_TOOL_STATUS_TEXT,
@@ -30,27 +34,48 @@ test("mapProviderEventToTelegramStatus maps thread and reasoning events to under
   });
 });
 
-test("mapProviderEventToTelegramStatus attaches concise detail for work events", () => {
+test("mapProviderEventToTelegramStatus attaches sanitized detail for work events", () => {
   const command = mapProviderEventToTelegramStatus({
     type: "item.started",
     itemType: "command_execution",
-    command: "npm run check",
+    command: "C:\\tools\\npm.cmd run check -- --very-long-flag",
   });
   const webSearch = mapProviderEventToTelegramStatus({
     type: "item.started",
     itemType: "web_search",
-    query: "Codex non-interactive json events",
+    query: "Codex non-interactive json events https://example.com/debug?token=secret",
   });
   const tool = mapProviderEventToTelegramStatus({
     type: "item.completed",
     itemType: "mcp_tool_call",
-    toolName: "search_openai_docs",
+    toolName: "mcp/search_openai_docs",
+  });
+  const fileChange = mapProviderEventToTelegramStatus({
+    type: "item.completed",
+    itemType: "file_change",
+    aggregatedOutputPreview: "updated D:\\CodexProjects\\AnyBot\\src\\channels\\telegram.ts",
   });
 
   assert.equal(command?.phase, "processing");
-  assert.equal(command?.text, `${TELEGRAM_COMMAND_STATUS_TEXT}：npm run check`);
-  assert.equal(webSearch?.text, `${TELEGRAM_WEB_STATUS_TEXT}：Codex non-interactive json events`);
+  assert.equal(command?.text, `${TELEGRAM_COMMAND_STATUS_TEXT}：npm.cmd run`);
+  assert.equal(webSearch?.text, `${TELEGRAM_WEB_STATUS_TEXT}：Codex non-interactive json even...`);
   assert.equal(tool?.text, `${TELEGRAM_TOOL_STATUS_TEXT}：search_openai_docs`);
+  assert.equal(fileChange?.text, TELEGRAM_FILE_STATUS_TEXT);
+});
+
+test("telegram status detail builders strip long paths and URLs", () => {
+  assert.equal(
+    buildTelegramCommandStatus("D:\\workspace\\node_modules\\.bin\\tsx.cmd src\\server.ts"),
+    `${TELEGRAM_COMMAND_STATUS_TEXT}：tsx.cmd`,
+  );
+  assert.equal(
+    buildTelegramWebStatus("https://example.com/search?q=codex+status"),
+    TELEGRAM_WEB_STATUS_TEXT,
+  );
+  assert.equal(
+    buildTelegramToolStatus("plugins/search_openai_docs"),
+    `${TELEGRAM_TOOL_STATUS_TEXT}：search_openai_docs`,
+  );
 });
 
 test("mapProviderEventToTelegramStatus only finalizes on completed agent messages", () => {

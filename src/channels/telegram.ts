@@ -24,12 +24,16 @@ import {
   type TelegramMessage,
   type TelegramUpdate,
 } from "../telegram.js";
-import type { ProviderRuntimeEvent } from "../providers/index.js";
+import {
+  ProviderTimeoutError,
+  type ProviderRuntimeEvent,
+} from "../providers/index.js";
 import {
   findTelegramMessageRef,
   saveTelegramMessageRef,
 } from "../web/db.js";
 import {
+  buildTelegramImageStatus,
   getTelegramStatusPhaseRank,
   mapProviderEventToTelegramStatus,
   TELEGRAM_RECEIVED_STATUS_TEXT,
@@ -47,6 +51,9 @@ const SUPPLEMENT_RUNNING_TEXT = "正在重新整理你的问题…";
 const QUEUED_STATUS_TEXT = "排队中…";
 const STALE_DECISION_TEXT = "该选项已失效";
 const CALLBACK_PREFIX = "tgd";
+const TELEGRAM_IDLE_TIMEOUT_ERROR_TEXT = "本次任务因长时间无进展而超时，请稍后重试。";
+const TELEGRAM_MAX_RUNTIME_ERROR_TEXT = "本次任务已达到最长运行时长（60 分钟），请拆分任务后重试。";
+const TELEGRAM_GENERIC_ERROR_TEXT = "处理消息时出错了，请稍后再试。";
 
 type PendingKind = "text" | "photo" | "document";
 type DecisionAction = "supplement" | "queue";
@@ -231,6 +238,7 @@ export class TelegramRuntimeStatusTracker {
   private timer: NodeJS.Timeout | null = null;
   private flushPromise: Promise<void> | null = null;
   private disposed = false;
+  private stickyPreProcessingText: string | null = null;
 
   constructor(
     private readonly status: RuntimeStatusTarget,
@@ -253,10 +261,26 @@ export class TelegramRuntimeStatusTracker {
       return;
     }
 
+    if (
+      this.stickyPreProcessingText
+      && (event.type === "thread.started" || event.type === "turn.started")
+    ) {
+      return;
+    }
+
+    this.stickyPreProcessingText = null;
+
     this.enqueue(nextStatus.text, getTelegramStatusPhaseRank(nextStatus.phase));
   }
 
+  async showImageUnderstanding(): Promise<void> {
+    const nextStatus = buildTelegramImageStatus();
+    this.stickyPreProcessingText = nextStatus.text;
+    await this.showImmediate(nextStatus.text, getTelegramStatusPhaseRank(nextStatus.phase));
+  }
+
   async showSending(): Promise<void> {
+    this.stickyPreProcessingText = null;
     await this.showImmediate(TELEGRAM_SENDING_STATUS_TEXT, getTelegramStatusPhaseRank("sending"));
   }
 
@@ -551,6 +575,19 @@ function parseDecisionCallback(data?: string): { action: DecisionAction; decisio
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function getTelegramBatchFailureText(error: unknown): string {
+  if (error instanceof ProviderTimeoutError) {
+    if (error.kind === "idle") {
+      return TELEGRAM_IDLE_TIMEOUT_ERROR_TEXT;
+    }
+    if (error.kind === "max_runtime") {
+      return TELEGRAM_MAX_RUNTIME_ERROR_TEXT;
+    }
+  }
+
+  return TELEGRAM_GENERIC_ERROR_TEXT;
 }
 
 function startTypingIndicatorLoop(
@@ -1063,8 +1100,11 @@ export class TelegramChannel implements IChannel {
     );
 
     try {
-      const prepared = await this.prepareBatchInput(botToken, running.batch, cleanupDirs);
       runtimeStatusTracker.prime(running.startText);
+      if (running.batch.items.some((item) => item.kind === "photo")) {
+        await runtimeStatusTracker.showImageUnderstanding();
+      }
+      const prepared = await this.prepareBatchInput(botToken, running.batch, cleanupDirs);
       const handleProviderEvent = (event: ProviderRuntimeEvent) => {
         runtimeStatusTracker.handleProviderEvent(event);
       };
@@ -1110,13 +1150,17 @@ export class TelegramChannel implements IChannel {
           batchId: running.batch.id,
         });
       } else {
+        const timeoutKind = error instanceof ProviderTimeoutError ? error.kind : null;
+        const hadProgress = error instanceof ProviderTimeoutError ? error.hadProgress : null;
         logger.error("telegram.batch.failed", {
           chatId,
           batchId: running.batch.id,
+          timeoutKind,
+          hadProgress,
           error,
         });
         if (state.running?.id === running.id) {
-          await running.batch.status.show("处理消息时出错了，请稍后再试。");
+          await running.batch.status.show(getTelegramBatchFailureText(error));
         }
       }
     } finally {

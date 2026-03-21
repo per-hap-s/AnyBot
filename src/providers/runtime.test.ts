@@ -8,12 +8,17 @@ import {
   shouldRetryFreshSessionAfterTimeout,
 } from "./codex.js";
 import {
+  DEFAULT_PROVIDER_MAX_RUNTIME_MS,
   getProviderLongStepKey,
   isProviderLongStepItemType,
   isProviderProgressEvent,
   normalizeProviderRuntimeEvent,
   shouldTriggerProviderIdleTimeout,
 } from "./runtime.js";
+
+test("DEFAULT_PROVIDER_MAX_RUNTIME_MS defaults to 60 minutes", () => {
+  assert.equal(DEFAULT_PROVIDER_MAX_RUNTIME_MS, 3_600_000);
+});
 
 test("normalizeProviderRuntimeEvent extracts command execution details", () => {
   const event = normalizeProviderRuntimeEvent({
@@ -81,7 +86,7 @@ test("shouldRetryFreshSessionAfterTimeout only allows idle timeouts with no prog
     false,
   );
   assert.equal(
-    shouldRetryFreshSessionAfterTimeout(new ProviderTimeoutError("max_runtime", 1_800_000, false)),
+    shouldRetryFreshSessionAfterTimeout(new ProviderTimeoutError("max_runtime", 3_600_000, false)),
     false,
   );
 });

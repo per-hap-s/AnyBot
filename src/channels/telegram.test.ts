@@ -2,15 +2,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as delay } from "node:timers/promises";
 
+import { ProviderTimeoutError } from "../providers/index.js";
 import type { TelegramMessage } from "../telegram.js";
 import {
   cleanupTelegramChatState,
+  getTelegramBatchFailureText,
   StatusMessageController,
   TelegramRuntimeStatusTracker,
 } from "./telegram.js";
 import {
   TELEGRAM_COMMAND_STATUS_TEXT,
   TELEGRAM_FINALIZING_STATUS_TEXT,
+  TELEGRAM_IMAGE_STATUS_TEXT,
   TELEGRAM_RECEIVED_STATUS_TEXT,
   TELEGRAM_SENDING_STATUS_TEXT,
 } from "./telegram-status.js";
@@ -85,8 +88,39 @@ test("TelegramRuntimeStatusTracker keeps the latest processing text and blocks u
 
   assert.deepEqual(shown, [
     TELEGRAM_FINALIZING_STATUS_TEXT,
-    `${TELEGRAM_COMMAND_STATUS_TEXT}：npm run check`,
+    `${TELEGRAM_COMMAND_STATUS_TEXT}：npm run`,
     TELEGRAM_SENDING_STATUS_TEXT,
+  ]);
+});
+
+test("TelegramRuntimeStatusTracker keeps image understanding until the first work item", async () => {
+  const shown: string[] = [];
+  const tracker = new TelegramRuntimeStatusTracker(
+    {
+      show: async (text: string) => {
+        shown.push(text);
+      },
+    },
+    () => true,
+    0,
+  );
+
+  tracker.prime(TELEGRAM_RECEIVED_STATUS_TEXT);
+  await tracker.showImageUnderstanding();
+  tracker.handleProviderEvent({
+    type: "thread.started",
+  });
+  await delay(0);
+  tracker.handleProviderEvent({
+    type: "item.started",
+    itemType: "command_execution",
+    command: "npm run check",
+  });
+  await delay(0);
+
+  assert.deepEqual(shown, [
+    TELEGRAM_IMAGE_STATUS_TEXT,
+    `${TELEGRAM_COMMAND_STATUS_TEXT}：npm run`,
   ]);
 });
 
@@ -112,6 +146,21 @@ test("TelegramRuntimeStatusTracker drops delayed updates after dispose", async (
   await delay(40);
 
   assert.deepEqual(shown, []);
+});
+
+test("getTelegramBatchFailureText distinguishes idle timeout, max runtime, and generic failures", () => {
+  assert.equal(
+    getTelegramBatchFailureText(new ProviderTimeoutError("idle", 120_000, false)),
+    "本次任务因长时间无进展而超时，请稍后重试。",
+  );
+  assert.equal(
+    getTelegramBatchFailureText(new ProviderTimeoutError("max_runtime", 3_600_000, true)),
+    "本次任务已达到最长运行时长（60 分钟），请拆分任务后重试。",
+  );
+  assert.equal(
+    getTelegramBatchFailureText(new Error("boom")),
+    "处理消息时出错了，请稍后再试。",
+  );
 });
 
 test("cleanupTelegramChatState disposes trackers, aborts running work, and deletes all status messages", async () => {

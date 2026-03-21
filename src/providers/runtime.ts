@@ -2,7 +2,7 @@ import type { CodexJsonEvent } from "../types.js";
 import type { ProviderProgressKind, ProviderRuntimeEvent } from "./types.js";
 
 export const DEFAULT_PROVIDER_IDLE_TIMEOUT_MS = 120_000;
-export const DEFAULT_PROVIDER_MAX_RUNTIME_MS = 1_800_000;
+export const DEFAULT_PROVIDER_MAX_RUNTIME_MS = 3_600_000;
 
 export const PROVIDER_PROGRESS_ITEM_TYPES = new Set([
   "command_execution",
