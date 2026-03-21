@@ -138,6 +138,24 @@ test("StatusMessageController does not recreate a sealed status message", async 
   assert.equal(controller.isSealed, true);
 });
 
+test("StatusMessageController ignores Telegram no-op edit errors for identical content", async () => {
+  const calls: string[] = [];
+  const controller = new StatusMessageController("token", 1, 10, {
+    send: async () => createTelegramMessage(100),
+    edit: async () => {
+      calls.push("edit");
+      throw new Error("Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message");
+    },
+    delete: async () => true as never,
+  });
+
+  controller.seedExisting(createTelegramMessage(100));
+  await controller.show("已收到消息", { clearKeyboard: true });
+  await controller.show("已收到消息", { clearKeyboard: true });
+
+  assert.deepEqual(calls, ["edit"]);
+});
+
 test("TelegramRuntimeStatusTracker keeps the latest processing text and blocks updates after sending", async () => {
   const shown: string[] = [];
   const tracker = new TelegramRuntimeStatusTracker(

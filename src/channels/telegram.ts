@@ -89,6 +89,10 @@ function toErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function isTelegramMessageNotModifiedError(error: unknown): boolean {
+  return toErrorText(error).toLowerCase().includes("message is not modified");
+}
+
 type StatusMessageTransport = {
   send: typeof sendTelegramMessage;
   edit: typeof editTelegramMessageText;
@@ -222,13 +226,19 @@ export class StatusMessageController {
           replyMarkup,
         });
       } else {
-        await this.transport.edit(
-          this.botToken,
-          this.chatId,
-          this.statusMessage.message_id,
-          text,
-          replyMarkup ? { replyMarkup } : undefined,
-        );
+        try {
+          await this.transport.edit(
+            this.botToken,
+            this.chatId,
+            this.statusMessage.message_id,
+            text,
+            replyMarkup ? { replyMarkup } : undefined,
+          );
+        } catch (error) {
+          if (!isTelegramMessageNotModifiedError(error)) {
+            throw error;
+          }
+        }
       }
 
       this.currentText = text;

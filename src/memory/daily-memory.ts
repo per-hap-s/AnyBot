@@ -12,14 +12,18 @@ function ensureFileHeader(filePath: string, date: Date): void {
   writeFileSync(filePath, `# Daily Memory\n\n## ${date.toISOString().slice(0, 10)}\n`, "utf-8");
 }
 
-function buildEntryLine(scope: MemoryScope, fact: ExtractedFact, timestamp: Date): string {
-  const sourceRef = fact.sourceRef ? `[source:${fact.sourceRef}]` : "";
-  return `- [${formatTimePart(timestamp)}][scope:${scope}][confidence:${fact.confidence.toFixed(2)}][type:${fact.durability}]${sourceRef} ${fact.text}\n`;
+function buildStableMemoryKey(scope: MemoryScope, fact: ExtractedFact): string {
+  return `[scope:${scope}][type:${fact.durability}][category:${fact.category}][source:${fact.sourceRef || ""}] ${fact.text.trim()}`;
 }
 
-function appendUniqueLine(filePath: string, line: string): void {
+function buildEntryLine(scope: MemoryScope, fact: ExtractedFact, timestamp: Date): string {
+  const sourceRef = fact.sourceRef ? `[source:${fact.sourceRef}]` : "";
+  return `- [${formatTimePart(timestamp)}][scope:${scope}][confidence:${fact.confidence.toFixed(2)}][type:${fact.durability}][category:${fact.category}]${sourceRef} ${fact.text}\n`;
+}
+
+function appendUniqueLine(filePath: string, line: string, stableKey: string): void {
   const existing = readFileSync(filePath, "utf-8");
-  if (existing.includes(line.trim())) {
+  if (existing.includes(stableKey)) {
     return;
   }
 
@@ -36,7 +40,7 @@ export function appendDailyMemoryFact(
   ensureFileHeader(filePath, timestamp);
 
   const line = buildEntryLine(scope, fact, timestamp);
-  appendUniqueLine(filePath, line);
+  appendUniqueLine(filePath, line, buildStableMemoryKey(scope, fact));
 }
 
 export function appendDailyMemoryInvalidation(
@@ -47,6 +51,7 @@ export function appendDailyMemoryInvalidation(
 ): void {
   const filePath = getDailyMemoryPath(workdir, timestamp);
   ensureFileHeader(filePath, timestamp);
+  const stableKey = `[scope:${scope}][type:invalidation] ${text.trim()}`;
   const line = `- [${formatTimePart(timestamp)}][scope:${scope}][type:invalidation] 用户要求忘记：${text}\n`;
-  appendUniqueLine(filePath, line);
+  appendUniqueLine(filePath, line, stableKey);
 }

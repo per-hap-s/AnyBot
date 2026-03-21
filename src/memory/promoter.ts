@@ -1,3 +1,4 @@
+import { isMemoryCategory } from "./category.js";
 import type { IProvider } from "../providers/types.js";
 import type { MemoryEntry, CanonicalMemory } from "../web/db.js";
 import type { CanonicalMemoryCandidate } from "./types.js";
@@ -8,6 +9,7 @@ type PromotionResponse = {
   canonical_memories?: Array<{
     text?: string;
     confidence?: number;
+    category?: string;
   }>;
 };
 
@@ -46,7 +48,7 @@ function formatDailyEntries(entries: MemoryEntry[]): string {
   }
 
   return entries
-    .map((entry) => `- id=${entry.id}; text=${entry.text}; confidence=${entry.confidence}; durability=${entry.durability}`)
+    .map((entry) => `- id=${entry.id}; category=${entry.category}; text=${entry.text}; confidence=${entry.confidence}; durability=${entry.durability}`)
     .join("\n");
 }
 
@@ -56,7 +58,7 @@ function formatCanonicalEntries(entries: CanonicalMemory[]): string {
   }
 
   return entries
-    .map((entry) => `- text=${entry.text}; confidence=${entry.confidence}; status=${entry.status}`)
+    .map((entry) => `- category=${entry.category}; text=${entry.text}; confidence=${entry.confidence}; status=${entry.status}`)
     .join("\n");
 }
 
@@ -67,7 +69,7 @@ function buildPromotionPrompt(
   return [
     "Promote durable private-assistant memories into a compact canonical memory set.",
     "Return JSON only. No markdown. No prose.",
-    'Schema: {"canonical_memories":[{"text":"string","confidence":0.0}]}',
+    'Schema: {"canonical_memories":[{"text":"string","confidence":0.0,"category":"preference|identity|workflow|environment|project"}]}',
     "Rules:",
     "- Produce the final canonical memory set, not a diff.",
     "- Keep only stable identity facts, stable preferences, long-term goals, and durable workflow/environment facts that matter repeatedly.",
@@ -75,6 +77,7 @@ function buildPromotionPrompt(
     "- Prefer the more specific and more recent wording when two memories overlap.",
     "- Exclude one-off states, temporary constraints, and noise.",
     "- Keep each `text` as a short standalone fact in Chinese.",
+    "- `category` must stay aligned with the supporting daily entries.",
     "- Keep the set compact. Usually 3-12 items.",
     "- If a prior canonical memory is no longer supported by the active daily memories, leave it out of the final set.",
     "",
@@ -114,6 +117,7 @@ export async function promoteCanonicalMemories(
     .map((item) => ({
       text: normalizeFactText(item.text!),
       confidence: clampConfidence(item.confidence),
+      category: isMemoryCategory(item.category) ? item.category : undefined,
     }))
     .filter((item) => {
       const key = item.text.trim().toLowerCase();

@@ -43,7 +43,7 @@ import {
   buildRelevantMemoryPromptSection,
   enqueueAutomaticMemoryJobs,
   isMemoryQuestion,
-  retrieveRelevantCanonicalMemories,
+  retrieveRelevantCanonicalMemoriesDetailed,
   resolveUnifiedPrivateMemoryScope,
 } from "../memory/index.js";
 
@@ -187,15 +187,23 @@ async function buildSessionMemoryContext(
 
   if (scope) {
     try {
-      const hits = await retrieveRelevantCanonicalMemories(scope, userText);
+      const { hits, diagnostics } = await retrieveRelevantCanonicalMemoriesDetailed(scope, userText);
       logger.info("web.memory.retrieve.completed", {
         scope,
         sessionId: session.id,
         queryChars: userText.length,
         hitCount: hits.length,
+        queryCategories: diagnostics.queryCategories,
+        preliminaryHitCount: diagnostics.preliminaryHitCount,
+        rerankCandidateCount: diagnostics.rerankCandidateCount,
+        rerankUsed: diagnostics.rerankUsed,
+        rerankFailed: diagnostics.rerankFailed,
+        embeddingAvailable: diagnostics.embeddingAvailable,
+        safeguardApplied: diagnostics.safeguardApplied,
         hits: hits.map((hit) => ({
           id: hit.id,
-          text: hit.text,
+          category: hit.category,
+          confidence: Number(hit.confidence.toFixed(4)),
           score: Number(hit.score.toFixed(4)),
         })),
       });
@@ -621,6 +629,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
         providerSessionId,
         provider: provider.type,
         replyChars: result.text.length,
+        repairedIncompleteReply: completionOutcome.repaired,
       });
 
       if (resolveUnifiedPrivateMemoryScope("web", session.id)) {
@@ -629,7 +638,6 @@ export function chatRouter(options: ApiRouterOptions): Router {
           chatId: session.id,
           userText: prepared.userText,
           assistantText: result.text,
-        repairedIncompleteReply: completionOutcome.repaired,
         });
       }
 
@@ -832,6 +840,7 @@ export function chatRouter(options: ApiRouterOptions): Router {
         providerSessionId,
         provider: provider.type,
         replyChars: result.text.length,
+        repairedIncompleteReply: completionOutcome.repaired,
       });
 
       if (resolveUnifiedPrivateMemoryScope("web", session.id)) {
@@ -840,7 +849,6 @@ export function chatRouter(options: ApiRouterOptions): Router {
           chatId: session.id,
           userText: prepared.userText,
           assistantText: result.text,
-        repairedIncompleteReply: completionOutcome.repaired,
         });
       }
 

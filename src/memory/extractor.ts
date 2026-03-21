@@ -1,3 +1,4 @@
+import { inferMemoryCategoryFromText, isMemoryCategory } from "./category.js";
 import type { IProvider } from "../providers/types.js";
 import type { ExtractedFact, MemoryInvalidationDecision } from "./types.js";
 import type { MemoryEntry } from "../web/db.js";
@@ -9,6 +10,7 @@ type ExtractionResponse = {
     text?: string;
     confidence?: number;
     durability?: string;
+    category?: string;
     should_store?: boolean;
   }>;
 };
@@ -18,17 +20,21 @@ function buildExtractionPrompt(userText: string, assistantText: string): string 
     "Extract durable personal-assistant memory candidates from this private chat turn.",
     "Return JSON only. No markdown. No prose.",
     "Schema:",
-    '{"facts":[{"text":"string","confidence":0.0,"durability":"medium|long_term_candidate","should_store":true}]}',
+    '{"facts":[{"text":"string","confidence":0.0,"durability":"medium|long_term_candidate","category":"preference|identity|workflow|environment|project","should_store":true}]}',
     "Rules:",
-    "- Keep only stable preferences, identity facts, recurring goals, durable environment facts, and validated lessons.",
+    "- Keep stable preferences, identity facts, recurring goals, durable workflow facts, durable environment facts, project facts, and validated lessons.",
+    "- Because retrieval uses embeddings and canonical promotion, it is acceptable to keep moderately useful durable facts instead of only ultra-strict facts.",
     "- Treat explicit remember/default/from now on/call me/avoid/first-then statements as strong memory signals.",
     "- Exclude one-off tasks, temporary status, speculative claims, emotional reactions, and disposable chatter.",
     "- `text` must be a short standalone fact in Chinese.",
+    "- `category` must be one of: preference, identity, workflow, environment, project.",
     "- Use `should_store=false` when uncertain.",
     "Examples:",
-    '- "记住：以后回答时先给结论，再补解释" -> "用户偏好：回答时先给结论，再补解释。"',
-    '- "记住：默认少用项目符号" -> "用户偏好：默认少用项目符号。"',
-    '- "我叫LI，以后这样叫我" -> "用户希望以后被称为LI。"',
+    '- "记住：以后回答时先给结论，再补充解释" -> {"text":"用户偏好：回答时先给结论，再补充解释。","category":"preference"}',
+    '- "我叫LI，以后这样叫我" -> {"text":"用户希望被称为LI。","category":"identity"}',
+    '- "我的任务文件都在D盘，还会附带手册" -> {"text":"用户的任务文件通常放在D盘，并常附带手册。","category":"workflow"}',
+    '- "AnyBot 记忆用 bge-m3 做 embedding" -> {"text":"AnyBot 当前记忆使用 BAAI/bge-m3 进行 embedding。","category":"environment"}',
+    '- "ProxyPilot 是另一个长期任务项目" -> {"text":"ProxyPilot 是用户的长期项目之一。","category":"project"}',
     '- "今天中午我吃了面" -> do not store',
     "",
     "User message:",
@@ -66,30 +72,39 @@ function extractJsonObject(text: string): string {
 function normalizeFactText(text: string): string {
   const trimmed = text.trim();
   if (!trimmed) return trimmed;
-  if (/[。！？.!?]$/.test(trimmed)) {
+  if (/[。！？?!]$/.test(trimmed)) {
     return trimmed;
   }
   return `${trimmed}。`;
 }
 
 function heuristicExplicitFact(userText: string): ExtractedFact | null {
-  const match = userText.trim().match(/^记住[:：]\s*(.+)$/);
-  if (!match) return null;
+  const trimmed = userText.trim();
+  const match = trimmed.match(/^记住[:：]?\s*(.+)$/);
+  const body = match?.[1]?.trim() || trimmed;
 
-  const body = match[1].trim();
-  if (!body) return null;
-
-  let text = body;
-  if (/^(以后回答时|默认|先.+再.+|不要|少用|尽量)/.test(body)) {
-    text = `用户偏好：${body}`;
-  } else if (/^(我叫|叫我)/.test(body)) {
-    text = body.replace(/^我叫/, "用户名叫");
+  const strongSignal = /记住|以后|默认|不要|尽量|少用|偏好|习惯|工作流|环境|项目|手册|任务文件|路径|目录|我叫|叫我|称呼|RAG|embedding|bge/i
+    .test(trimmed);
+  if (!strongSignal || !body) {
+    return null;
   }
 
+  let text = body;
+  if (/^(以后|默认|不要|尽量|少用|回答时|回复时)/.test(body)) {
+    text = `用户偏好：${body}`;
+  } else if (/^(我叫|叫我|称呼我)/.test(body)) {
+    text = body
+      .replace(/^我叫/, "用户希望被称为")
+      .replace(/^叫我/, "用户希望被称为")
+      .replace(/^称呼我/, "用户希望被称为");
+  }
+
+  const normalizedText = normalizeFactText(text);
   return {
-    text: normalizeFactText(text),
-    confidence: 0.98,
-    durability: "long_term_candidate",
+    text: normalizedText,
+    confidence: match ? 0.98 : 0.82,
+    durability: match ? "long_term_candidate" : "medium",
+    category: inferMemoryCategoryFromText(normalizedText),
     sourceType: "daily_memory",
     sourceRef: null,
     lastConfirmedAt: Date.now(),
@@ -100,13 +115,13 @@ function buildInvalidationPrompt(userText: string, entries: MemoryEntry[]): stri
   const list = entries.length === 0
     ? "(none)"
     : entries
-        .map((entry) => `- id=${entry.id}; text=${entry.text}; status=${entry.status}`)
+        .map((entry) => `- id=${entry.id}; category=${entry.category}; text=${entry.text}; status=${entry.status}`)
         .join("\n");
 
   return [
     "Select which active memories should be invalidated based on the user's forget/delete request.",
     "Return JSON only. No markdown. No prose.",
-    'Schema: {"target_ids":["string"]}',
+    '{"target_ids":["string"]}',
     "Rules:",
     "- Only choose ids that the user clearly wants to forget, delete, remove, or stop using.",
     "- If nothing matches, return an empty array.",
@@ -141,14 +156,20 @@ export async function extractDurableFacts(
 
   const normalizedFacts = facts
     .filter((fact) => fact.should_store === true && typeof fact.text === "string" && fact.text.trim())
-    .map((fact) => ({
-      text: normalizeFactText(fact.text!),
-      confidence: clampConfidence(fact.confidence),
-      durability: normalizeDurability(fact.durability),
-      sourceType: "daily_memory" as const,
-      sourceRef: null,
-      lastConfirmedAt: Date.now(),
-    }));
+    .map((fact) => {
+      const text = normalizeFactText(fact.text!);
+      return {
+        text,
+        confidence: clampConfidence(fact.confidence),
+        durability: normalizeDurability(fact.durability),
+        category: isMemoryCategory(fact.category)
+          ? fact.category
+          : inferMemoryCategoryFromText(text),
+        sourceType: "daily_memory" as const,
+        sourceRef: null,
+        lastConfirmedAt: Date.now(),
+      };
+    });
 
   if (normalizedFacts.length > 0) {
     return normalizedFacts;

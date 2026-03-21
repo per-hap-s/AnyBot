@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 
+import { inferMemoryCategoryFromText } from "./category.js";
 import * as db from "../web/db.js";
 import { generateId } from "../shared.js";
 import type {
@@ -12,6 +13,48 @@ import type {
 
 function hashText(text: string): string {
   return createHash("sha256").update(text.trim()).digest("hex");
+}
+
+function parseSourceEntryIds(sourceJson: string | null): string[] {
+  if (!sourceJson) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(sourceJson) as { sourceEntryIds?: unknown[] };
+    return (parsed.sourceEntryIds || []).filter(
+      (value): value is string => typeof value === "string" && value.trim().length > 0,
+    );
+  } catch {
+    return [];
+  }
+}
+
+function resolveCategoryFromSourceEntries(
+  text: string,
+  sourceEntries: Array<{ id: string; text: string; status: string; category?: string }>,
+  fallbackCategory?: string,
+): ReturnType<typeof inferMemoryCategoryFromText> {
+  const counts = new Map<ReturnType<typeof inferMemoryCategoryFromText>, number>();
+
+  for (const entry of sourceEntries) {
+    if (!entry.category) {
+      continue;
+    }
+    const category = entry.category as ReturnType<typeof inferMemoryCategoryFromText>;
+    counts.set(category, (counts.get(category) || 0) + 1);
+  }
+
+  if (counts.size > 0) {
+    return [...counts.entries()]
+      .sort((left, right) => right[1] - left[1])[0]?.[0] || inferMemoryCategoryFromText(text);
+  }
+
+  if (fallbackCategory) {
+    return fallbackCategory as ReturnType<typeof inferMemoryCategoryFromText>;
+  }
+
+  return inferMemoryCategoryFromText(text);
 }
 
 export function buildPrivateMemoryScope(chatId: string): MemoryScope {
@@ -35,6 +78,7 @@ export function saveExtractedFact(
     textHash,
     confidence: fact.confidence,
     durability: fact.durability,
+    category: fact.category || inferMemoryCategoryFromText(fact.text),
     status: "active",
     embeddingStatus: existing?.embeddingStatus || "pending",
     embeddingModel: existing?.embeddingModel || null,
@@ -169,6 +213,48 @@ export function invalidateMemoryEntries(
   return changed;
 }
 
+export function invalidateCanonicalMemories(
+  ids: string[],
+  status: db.CanonicalMemory["status"] = "rejected",
+): number {
+  const now = Date.now();
+  let changed = 0;
+
+  for (const id of ids) {
+    const target = db.getCanonicalMemoryById(id);
+    if (!target || target.status === status) {
+      continue;
+    }
+
+    db.updateCanonicalMemoryStatus({
+      id,
+      status,
+      updatedAt: now,
+      lastPromotedAt: now,
+    });
+    changed += 1;
+  }
+
+  return changed;
+}
+
+export function invalidateCanonicalMemoriesBySourceEntryIds(
+  scope: MemoryScope,
+  sourceEntryIds: string[],
+  status: db.CanonicalMemory["status"] = "rejected",
+): number {
+  if (sourceEntryIds.length === 0) {
+    return 0;
+  }
+
+  const entryIdSet = new Set(sourceEntryIds);
+  const matchedIds = listActiveCanonicalMemoriesByScope(scope)
+    .filter((entry) => parseSourceEntryIds(entry.sourceJson).some((id) => entryIdSet.has(id)))
+    .map((entry) => entry.id);
+
+  return invalidateCanonicalMemories(matchedIds, status);
+}
+
 export function recoverRunningMemoryJobs(): number {
   return db.resetRunningMemoryJobs(Date.now());
 }
@@ -194,7 +280,7 @@ export function markCanonicalMemoryEmbedding(
 export function syncCanonicalMemories(
   scope: MemoryScope,
   candidates: CanonicalMemoryCandidate[],
-  sourceEntries: Array<{ id: string; text: string; status: string }>,
+  sourceEntries: Array<{ id: string; text: string; status: string; category?: string }>,
 ): {
   activeCount: number;
   upsertedCount: number;
@@ -216,6 +302,7 @@ export function syncCanonicalMemories(
     const sourceJson = JSON.stringify({
       sourceEntryIds: sourceEntries.map((entry) => entry.id),
       sourceTexts: sourceEntries.map((entry) => entry.text),
+      sourceCategories: sourceEntries.map((entry) => entry.category || null),
     });
 
     db.upsertCanonicalMemory({
@@ -224,6 +311,7 @@ export function syncCanonicalMemories(
       text,
       textHash,
       confidence: candidate.confidence,
+      category: resolveCategoryFromSourceEntries(text, sourceEntries, candidate.category || current?.category),
       status: "active",
       embeddingStatus: current?.embeddingStatus || "pending",
       embeddingModel: current?.embeddingModel || null,

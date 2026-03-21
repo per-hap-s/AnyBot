@@ -33,7 +33,12 @@ import {
   getRegisteredChannelTypes,
   readChannelsConfig,
 } from "../channels/index.js";
-import type { ChannelCallbacks, IChannel } from "../channels/index.js";
+import type {
+  ChannelCallbacks,
+  IChannel,
+  TelegramTaskAttemptInput,
+  TelegramTaskAttemptResult,
+} from "../channels/index.js";
 import type { ProviderRuntimeEvent } from "../providers/index.js";
 import type { RunResult } from "../providers/index.js";
 import * as db from "../web/db.js";
@@ -54,16 +59,21 @@ import {
   appendDailyMemoryInvalidation,
   appendDailyMemoryFact,
   buildRelevantMemoryPromptSection,
+  compareMemoryCategory,
   createEmbedding,
   enqueueMemoryJob,
   enqueueAutomaticMemoryJobs,
   enqueuePromotionJob,
   extractDurableFacts,
   getCanonicalMemoryById,
+  inferMemoryCategoryFromText,
   invalidateMemoryEntries,
+  invalidateCanonicalMemories,
+  invalidateCanonicalMemoriesBySourceEntryIds,
   listActiveCanonicalMemoriesByScope,
   listMemoryEntriesByScope,
   markCanonicalMemoryEmbedding,
+  MEMORY_CATEGORY_LABELS,
   MEMORY_CANONICAL_EMBED_JOB_KIND,
   MEMORY_EMBED_JOB_KIND,
   MEMORY_INVALIDATION_JOB_KIND,
@@ -76,7 +86,7 @@ import {
   promoteCanonicalMemories,
   recoverRunningMemoryJobs,
   isMemoryQuestion,
-  retrieveRelevantCanonicalMemories,
+  retrieveRelevantCanonicalMemoriesDetailed,
   resolveUnifiedPrivateMemoryScope,
   saveExtractedFact,
   selectMemoriesToInvalidate,
@@ -226,6 +236,35 @@ function createPendingCodexCheckStatus(): CodexCheckStatus {
   };
 }
 
+function normalizeForgetMatchText(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/[。！？?!,，;；:："'`]/g, "")
+    .replace(/\s+/g, " ");
+}
+
+function isSafeForgetMatch(candidateText: string, queryText: string): boolean {
+  const normalizedCandidate = normalizeForgetMatchText(candidateText);
+  const normalizedQuery = normalizeForgetMatchText(queryText);
+
+  if (!normalizedCandidate || !normalizedQuery) {
+    return false;
+  }
+  if (normalizedCandidate === normalizedQuery) {
+    return true;
+  }
+
+  const shorterLength = Math.min(normalizedCandidate.length, normalizedQuery.length);
+  const longerLength = Math.max(normalizedCandidate.length, normalizedQuery.length);
+  if (shorterLength < 10) {
+    return false;
+  }
+
+  const contains = normalizedCandidate.includes(normalizedQuery) || normalizedQuery.includes(normalizedCandidate);
+  return contains && shorterLength / longerLength >= 0.75;
+}
+
 export class AnyBotService {
   private readonly provider = initProvider(getProviderConfig());
   private readonly controlToken = ensureControlToken();
@@ -303,6 +342,152 @@ export class AnyBotService {
     return session;
   }
 
+  private async executeReplyRun(
+    options: {
+      chatId: string;
+      source: string;
+      userText: string;
+      imagePaths?: string[];
+      sessionId?: string | null;
+      memoryContext?: string;
+      onEvent?: (event: ProviderRuntimeEvent) => void;
+      signal?: AbortSignal;
+      shouldEnqueueMemory?: boolean;
+      canPersist?: () => boolean;
+      onFreshRetry?: () => void;
+    },
+  ): Promise<TelegramTaskAttemptResult> {
+    const {
+      chatId,
+      source,
+      userText,
+      imagePaths = [],
+      sessionId,
+      memoryContext,
+      onEvent,
+      signal,
+      shouldEnqueueMemory = false,
+      canPersist,
+      onFreshRetry,
+    } = options;
+    let effectiveInputSessionId = sessionId || null;
+    const resolvedMemoryContext = memoryContext
+      ?? await this.buildMemoryContextForReply(this.buildPrivateMemoryScopeForChat(source, chatId), userText);
+    const freshPrompt = buildFirstTurnPrompt(userText, source, resolvedMemoryContext);
+    const prompt = effectiveInputSessionId
+      ? buildResumePrompt(userText, source, resolvedMemoryContext)
+      : freshPrompt;
+
+    let result: RunResult;
+    try {
+      result = await getProvider().run({
+        workdir: getWorkdir(),
+        sandbox: getSandbox(),
+        model: getCurrentModel(),
+        prompt,
+        imagePaths,
+        sessionId: effectiveInputSessionId || undefined,
+        signal,
+        onEvent,
+      });
+    } catch (error) {
+      const shouldRetryFresh = Boolean(
+        effectiveInputSessionId
+        && !signal?.aborted
+        && shouldRetryFreshSessionAfterTimeout(error),
+      );
+      if (!shouldRetryFresh) {
+        throw error;
+      }
+
+      logger.warn("reply.generate.resume_timeout_retrying_fresh", {
+        chatId,
+        source,
+        provider: getProvider().type,
+        staleSessionId: effectiveInputSessionId,
+        timeoutKind: (error as ProviderTimeoutError).kind,
+      });
+      onFreshRetry?.();
+      effectiveInputSessionId = null;
+
+      result = await getProvider().run({
+        workdir: getWorkdir(),
+        sandbox: getSandbox(),
+        model: getCurrentModel(),
+        prompt: freshPrompt,
+        imagePaths,
+        signal,
+        onEvent,
+      });
+    }
+
+    if (signal?.aborted) {
+      throw new Error("Reply generation aborted");
+    }
+
+    const continuationSessionIdFallback = result.sessionId || effectiveInputSessionId || null;
+    const completionOutcome = await ensureCompletedUserReply({
+      userText,
+      result,
+      sessionIdFallback: continuationSessionIdFallback,
+      continueRun: async (continuationSessionId, continuationPrompt) => {
+        onEvent?.({
+          type: "reply.repair.started",
+          itemType: "completion_repair",
+          text: result.text,
+        });
+
+        logger.warn("reply.generate.incomplete_reply_retrying", {
+          chatId,
+          source,
+          provider: getProvider().type,
+          sessionId: continuationSessionId,
+          replyPreview: result.text.slice(0, 120),
+        });
+
+        return getProvider().run({
+          workdir: getWorkdir(),
+          sandbox: getSandbox(),
+          model: getCurrentModel(),
+          prompt: continuationPrompt,
+          sessionId: continuationSessionId,
+          signal,
+          onEvent,
+        });
+      },
+    });
+    result = completionOutcome.result;
+    const effectiveSessionId = result.sessionId
+      || (completionOutcome.repaired ? continuationSessionIdFallback : null)
+      || effectiveInputSessionId
+      || null;
+
+    if (completionOutcome.repaired) {
+      logger.info("reply.generate.incomplete_reply_repaired", {
+        chatId,
+        source,
+        provider: getProvider().type,
+        sessionId: effectiveSessionId,
+        replyChars: result.text.length,
+      });
+    }
+
+    if (shouldEnqueueMemory && (!canPersist || canPersist()) && this.buildPrivateMemoryScopeForChat(source, chatId)) {
+      enqueueAutomaticMemoryJobs({
+        source,
+        chatId,
+        userText,
+        assistantText: result.text,
+      });
+    }
+
+    return {
+      text: result.text,
+      sessionId: effectiveSessionId,
+      repairedIncompleteReply: completionOutcome.repaired,
+    };
+  }
+
   private async generateReply(
     chatId: string,
     userText: string,
@@ -314,12 +499,13 @@ export class AnyBotService {
     const conversationKey = this.buildConversationKey(source, chatId);
     const dbSession = this.getOrCreateChannelSession(source, chatId);
     const sessionId = this.sessionIdByChat.get(conversationKey) || dbSession.sessionId || null;
-    const memoryScope = this.buildPrivateMemoryScopeForChat(source, chatId);
-    const memoryContext = await this.buildMemoryContextForReply(memoryScope, userText);
-    const freshPrompt = buildFirstTurnPrompt(userText, source, memoryContext);
+    const memoryContext = await this.buildMemoryContextForReply(
+      this.buildPrivateMemoryScopeForChat(source, chatId),
+      userText,
+    );
     const prompt = sessionId
       ? buildResumePrompt(userText, source, memoryContext)
-      : freshPrompt;
+      : buildFirstTurnPrompt(userText, source, memoryContext);
     let expectedSessionGeneration = this.getSessionGeneration(source, chatId);
 
     db.addMessage(dbSession.id, "user", userText);
@@ -341,119 +527,38 @@ export class AnyBotService {
       ...(shouldLogContent ? { userText: rawLogString(userText) } : {}),
       ...(shouldLogPrompt ? { prompt: rawLogString(prompt) } : {}),
     });
-
-    let result: RunResult;
-    try {
-      result = await getProvider().run({
-        workdir: getWorkdir(),
-        sandbox: getSandbox(),
-        model: getCurrentModel(),
-        prompt,
-        imagePaths,
-        sessionId: sessionId || undefined,
-        signal,
-        onEvent,
-      });
-    } catch (error) {
-      const shouldRetryFresh = Boolean(
-        sessionId
-        && !signal?.aborted
-        && shouldRetryFreshSessionAfterTimeout(error),
-      );
-      if (!shouldRetryFresh) {
-        throw error;
-      }
-
-      logger.warn("reply.generate.resume_timeout_retrying_fresh", {
-        chatId,
-        source,
-        provider: getProvider().type,
-        staleSessionId: sessionId,
-        dbSessionId: dbSession.id,
-        timeoutKind: (error as ProviderTimeoutError).kind,
-      });
-
-      this.sessionIdByChat.delete(conversationKey);
-      this.sessionGenerationByChat.set(
-        conversationKey,
-        this.getSessionGeneration(source, chatId) + 1,
-      );
-      expectedSessionGeneration = this.getSessionGeneration(source, chatId);
-      db.updateSession({
-        id: dbSession.id,
-        title: dbSession.title,
-        sessionId: null,
-        updatedAt: Date.now(),
-      });
-      dbSession.sessionId = null;
-
-      result = await getProvider().run({
-        workdir: getWorkdir(),
-        sandbox: getSandbox(),
-        model: getCurrentModel(),
-        prompt: freshPrompt,
-        imagePaths,
-        signal,
-        onEvent,
-      });
-    }
-
-    if (signal?.aborted) {
-      throw new Error("Reply generation aborted");
-    }
-
-    const continuationSessionIdFallback = result.sessionId
-      || this.sessionIdByChat.get(conversationKey)
-      || dbSession.sessionId
-      || null;
-
-    const completionOutcome = await ensureCompletedUserReply({
+    const execution = await this.executeReplyRun({
+      chatId,
+      source,
       userText,
-      result,
-      sessionIdFallback: continuationSessionIdFallback,
-      continueRun: async (continuationSessionId, continuationPrompt) => {
-        logger.warn("reply.generate.incomplete_reply_retrying", {
-          chatId,
-          source,
-          provider: getProvider().type,
-          sessionId: continuationSessionId,
-          dbSessionId: dbSession.id,
-          replyPreview: result.text.slice(0, 120),
+      imagePaths,
+      sessionId,
+      memoryContext,
+      onEvent,
+      signal,
+      onFreshRetry: () => {
+        this.sessionIdByChat.delete(conversationKey);
+        this.sessionGenerationByChat.set(
+          conversationKey,
+          this.getSessionGeneration(source, chatId) + 1,
+        );
+        expectedSessionGeneration = this.getSessionGeneration(source, chatId);
+        db.updateSession({
+          id: dbSession.id,
+          title: dbSession.title,
+          sessionId: null,
+          updatedAt: Date.now(),
         });
-
-        return getProvider().run({
-          workdir: getWorkdir(),
-          sandbox: getSandbox(),
-          model: getCurrentModel(),
-          prompt: continuationPrompt,
-          sessionId: continuationSessionId,
-          signal,
-          onEvent,
-        });
+        dbSession.sessionId = null;
       },
     });
-    result = completionOutcome.result;
-    const effectiveSessionId = result.sessionId
-      || (completionOutcome.repaired ? continuationSessionIdFallback : null)
-      || dbSession.sessionId
-      || null;
-
-    if (completionOutcome.repaired) {
-      logger.info("reply.generate.incomplete_reply_repaired", {
-        chatId,
-        source,
-        provider: getProvider().type,
-        sessionId: effectiveSessionId,
-        dbSessionId: dbSession.id,
-        replyChars: result.text.length,
-      });
-    }
+    const effectiveSessionId = execution.sessionId;
 
     if (effectiveSessionId && expectedSessionGeneration === this.getSessionGeneration(source, chatId)) {
       this.sessionIdByChat.set(conversationKey, effectiveSessionId);
     }
 
-    db.addMessage(dbSession.id, "assistant", result.text);
+    db.addMessage(dbSession.id, "assistant", execution.text);
     db.updateSession({
       id: dbSession.id,
       title: dbSession.title,
@@ -467,8 +572,9 @@ export class AnyBotService {
       provider: getProvider().type,
       sessionId: effectiveSessionId,
       dbSessionId: dbSession.id,
-      replyChars: result.text.length,
-      ...(shouldLogContent ? { replyText: rawLogString(result.text) } : {}),
+      replyChars: execution.text.length,
+      repairedIncompleteReply: execution.repairedIncompleteReply,
+      ...(shouldLogContent ? { replyText: rawLogString(execution.text) } : {}),
     });
 
     if (this.buildPrivateMemoryScopeForChat(source, chatId)) {
@@ -476,11 +582,47 @@ export class AnyBotService {
         source,
         chatId,
         userText,
-        assistantText: result.text,
+        assistantText: execution.text,
       });
     }
 
-    return result.text;
+    return execution.text;
+  }
+
+  private async runTelegramTaskAttempt(
+    input: TelegramTaskAttemptInput,
+  ): Promise<TelegramTaskAttemptResult> {
+    logger.info("telegram.task_attempt.start", {
+      taskId: input.taskId,
+      attemptId: input.attemptId,
+      chatId: input.chatId,
+      imageCount: input.imagePaths?.length || 0,
+      userTextChars: input.userText.length,
+      providerSessionId: input.sessionId || null,
+    });
+
+    const result = await this.executeReplyRun({
+      chatId: input.chatId,
+      source: "telegram",
+      userText: input.userText,
+      imagePaths: input.imagePaths,
+      sessionId: input.sessionId,
+      onEvent: input.onEvent,
+      signal: input.signal,
+      shouldEnqueueMemory: true,
+      canPersist: input.canPersist,
+    });
+
+    logger.info("telegram.task_attempt.success", {
+      taskId: input.taskId,
+      attemptId: input.attemptId,
+      chatId: input.chatId,
+      providerSessionId: result.sessionId,
+      replyChars: result.text.length,
+      repairedIncompleteReply: result.repairedIncompleteReply,
+    });
+
+    return result;
   }
 
   private async buildMemoryContextForReply(
@@ -492,17 +634,24 @@ export class AnyBotService {
     }
 
     try {
-      const hits = await retrieveRelevantCanonicalMemories(scope, userText);
+      const { hits, diagnostics } = await retrieveRelevantCanonicalMemoriesDetailed(scope, userText);
       logger.info("memory.retrieve.completed", {
         scope,
         queryChars: userText.length,
         hitCount: hits.length,
+        queryCategories: diagnostics.queryCategories,
+        preliminaryHitCount: diagnostics.preliminaryHitCount,
+        rerankCandidateCount: diagnostics.rerankCandidateCount,
+        rerankUsed: diagnostics.rerankUsed,
+        rerankFailed: diagnostics.rerankFailed,
+        embeddingAvailable: diagnostics.embeddingAvailable,
+        safeguardApplied: diagnostics.safeguardApplied,
         hits: hits.map((hit) => ({
           id: hit.id,
-          text: hit.text,
+          category: hit.category,
+          confidence: Number(hit.confidence.toFixed(4)),
           score: Number(hit.score.toFixed(4)),
         })),
-      repairedIncompleteReply: completionOutcome.repaired,
       });
       return buildRelevantMemoryPromptSection(hits, {
         isMemoryQuestion: isMemoryQuestion(userText),
@@ -710,8 +859,9 @@ export class AnyBotService {
       entries,
     });
 
-    const changed = invalidateMemoryEntries(decision.targetIds);
-    if (changed > 0) {
+    const changedDaily = invalidateMemoryEntries(decision.targetIds);
+    const changedCanonical = invalidateCanonicalMemoriesBySourceEntryIds(scope, decision.targetIds);
+    if (changedDaily + changedCanonical > 0) {
       appendDailyMemoryInvalidation(getWorkdir(), scope, userText);
     }
 
@@ -720,11 +870,12 @@ export class AnyBotService {
       chatId,
       candidateCount: entries.length,
       targetCount: decision.targetIds.length,
-      changed,
+      changedDaily,
+      changedCanonical,
     });
 
-    if (changed > 0) {
-      enqueuePromotionJob(scope, `${Date.now()}:${changed}`);
+    if (changedDaily + changedCanonical > 0) {
+      enqueuePromotionJob(scope, `${Date.now()}:${changedDaily + changedCanonical}`);
     }
   }
 
@@ -751,6 +902,7 @@ export class AnyBotService {
         id: entry.id,
         text: entry.text,
         status: entry.status,
+        category: entry.category,
       })),
     );
 
@@ -801,21 +953,47 @@ export class AnyBotService {
 
   private getMemoryStatusSummary(): string {
     const entries = db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE);
-    const activeCount = entries.filter((entry) => entry.status === "active").length;
+    const activeEntries = entries.filter((entry) => entry.status === "active");
     const rejectedCount = entries.filter((entry) => entry.status === "rejected").length;
-    const readyCount = entries.filter((entry) => entry.embeddingStatus === "ready").length;
-    const canonicalCount = db.listCanonicalMemoriesByScope(OWNER_PRIVATE_MEMORY_SCOPE)
-      .filter((entry) => entry.status === "active")
-      .length;
+    const readyCount = activeEntries.filter((entry) => entry.embeddingStatus === "ready").length;
+    const canonicalEntries = db.listCanonicalMemoriesByScope(OWNER_PRIVATE_MEMORY_SCOPE)
+      .filter((entry) => entry.status === "active");
+    const categorySummary = Object.entries(
+      canonicalEntries.reduce<Record<string, number>>((accumulator, entry) => {
+        accumulator[entry.category] = (accumulator[entry.category] || 0) + 1;
+        return accumulator;
+      }, {}),
+    )
+      .sort(([left], [right]) => compareMemoryCategory(left as never, right as never))
+      .map(([category, count]) => `${MEMORY_CATEGORY_LABELS[category as keyof typeof MEMORY_CATEGORY_LABELS]} ${count}`)
+      .join(", ");
+
     return [
       "Memory status:",
       `- Scope: ${OWNER_PRIVATE_MEMORY_SCOPE}`,
-      `- Active: ${activeCount}`,
+      `- Active daily: ${activeEntries.length}`,
       `- Rejected: ${rejectedCount}`,
-      `- Canonical: ${canonicalCount}`,
+      `- Canonical: ${canonicalEntries.length}`,
       `- Embedding ready: ${readyCount}`,
+      `- Categories: ${categorySummary || "none"}`,
       "- Source of truth: structured memory store",
       "- MEMORY.md / PROFILE.md: legacy compatibility only",
+    ].join("\n");
+  }
+
+  private listMemorySummary(): string {
+    const canonicalEntries = db.listCanonicalMemoriesByScope(OWNER_PRIVATE_MEMORY_SCOPE)
+      .filter((entry) => entry.status === "active")
+      .sort((left, right) =>
+        compareMemoryCategory(left.category, right.category) || right.updatedAt - left.updatedAt);
+
+    if (canonicalEntries.length === 0) {
+      return "No active canonical memory is currently available.";
+    }
+
+    return [
+      "Active canonical memories:",
+      ...canonicalEntries.map((entry) => `- [${MEMORY_CATEGORY_LABELS[entry.category]}] ${entry.text}`),
     ].join("\n");
   }
 
@@ -823,10 +1001,12 @@ export class AnyBotService {
     text: string,
     sourceRef: string,
   ): { success: boolean; message: string } {
+    const category = inferMemoryCategoryFromText(text);
     const saved = saveExtractedFact(OWNER_PRIVATE_MEMORY_SCOPE, {
       text: text.trim(),
       confidence: 1,
       durability: "long_term_candidate",
+      category,
       sourceType: "long_term_memory",
       sourceRef,
       lastConfirmedAt: Date.now(),
@@ -836,6 +1016,7 @@ export class AnyBotService {
       text: text.trim(),
       confidence: 1,
       durability: "long_term_candidate",
+      category,
       sourceType: "long_term_memory",
       sourceRef,
       lastConfirmedAt: Date.now(),
@@ -862,6 +1043,63 @@ export class AnyBotService {
 
   private async updateProfile(text: string): Promise<{ success: boolean; message: string }> {
     return this.upsertManualMemory(text, "manual:profile");
+  }
+
+  private async forgetMemory(text: string): Promise<{ success: boolean; message: string }> {
+    const needle = text.trim();
+    if (!needle) {
+      return { success: false, message: "Usage: /forget <memory text>" };
+    }
+
+    const activeEntries = db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE)
+      .filter((entry) => entry.status === "active");
+    const activeCanonical = db.listCanonicalMemoriesByScope(OWNER_PRIVATE_MEMORY_SCOPE)
+      .filter((entry) => entry.status === "active");
+
+    let selectedEntryIds: string[] = [];
+    try {
+      const decision = await selectMemoriesToInvalidate(this.provider, {
+        workdir: getWorkdir(),
+        sandbox: getSandbox(),
+        userText: needle,
+        entries: activeEntries,
+      });
+      selectedEntryIds = decision.targetIds;
+    } catch (error) {
+      logger.warn("memory.forget.selector_failed", {
+        scope: OWNER_PRIVATE_MEMORY_SCOPE,
+        queryChars: needle.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    const exactEntryIds = activeEntries
+      .filter((entry) => isSafeForgetMatch(entry.text, needle))
+      .map((entry) => entry.id);
+    const directCanonicalIds = activeCanonical
+      .filter((entry) => isSafeForgetMatch(entry.text, needle))
+      .map((entry) => entry.id);
+
+    const dailyTargetIds = [...new Set([...selectedEntryIds, ...exactEntryIds])];
+    const changedDaily = invalidateMemoryEntries(dailyTargetIds);
+    const changedCanonicalLinked = invalidateCanonicalMemoriesBySourceEntryIds(
+      OWNER_PRIVATE_MEMORY_SCOPE,
+      dailyTargetIds,
+    );
+    const changedCanonicalDirect = invalidateCanonicalMemories(directCanonicalIds);
+    const changedCanonical = changedCanonicalLinked + changedCanonicalDirect;
+
+    if (changedDaily + changedCanonical === 0) {
+      return { success: false, message: `No active memory matched: ${text}` };
+    }
+
+    appendDailyMemoryInvalidation(getWorkdir(), OWNER_PRIVATE_MEMORY_SCOPE, text);
+    enqueuePromotionJob(OWNER_PRIVATE_MEMORY_SCOPE, `${Date.now()}:manual-forget`);
+
+    return {
+      success: true,
+      message: `Forgot ${changedDaily} daily and ${changedCanonical} canonical memories matching: ${text}`,
+    };
   }
 
   private async compressMemory(): Promise<{ success: boolean; message: string }> {
@@ -1160,9 +1398,12 @@ export class AnyBotService {
       listModels: () => this.listModels(),
       switchModel: (modelId) => this.handleSwitchModel(modelId),
       getMemoryStatus: () => this.getMemoryStatusSummary(),
+      listMemories: () => this.listMemorySummary(),
       remember: (text) => this.rememberMemory(text),
       updateProfile: (text) => this.updateProfile(text),
+      forgetMemory: (text) => this.forgetMemory(text),
       compressMemory: () => this.compressMemory(),
+      runTelegramTaskAttempt: (input) => this.runTelegramTaskAttempt(input),
     };
 
     const webApp = createApp({
@@ -1206,6 +1447,8 @@ export class AnyBotService {
         count: recoveredJobs,
       });
     }
+    const categoryBackfill = db.backfillLegacyMemoryCategories();
+    logger.info("memory.category_backfill.completed", categoryBackfill);
     this.memoryWorker.start();
     if (db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE).length > 0) {
       enqueuePromotionJob(OWNER_PRIVATE_MEMORY_SCOPE, `startup:${this.startedAt}`);

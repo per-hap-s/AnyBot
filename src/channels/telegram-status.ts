@@ -10,6 +10,7 @@ export const TELEGRAM_WEB_STATUS_TEXT = "正在搜索网页";
 export const TELEGRAM_TOOL_STATUS_TEXT = "正在调用工具";
 export const TELEGRAM_FILE_STATUS_TEXT = "正在修改文件";
 export const TELEGRAM_FINALIZING_STATUS_TEXT = "正在整理回复";
+export const TELEGRAM_REPAIRING_STATUS_TEXT = "正在补全查询结果";
 export const TELEGRAM_SENDING_STATUS_TEXT = "正在发送回复";
 
 export type TelegramRuntimeStatusPhase =
@@ -41,7 +42,7 @@ function truncateDetail(value: string, maxLength: number): string {
     return value;
   }
 
-  return `${value.slice(0, Math.max(1, maxLength - 1))}...`;
+  return `${value.slice(0, Math.max(1, maxLength - 3))}...`;
 }
 
 function stripWrappingQuotes(value: string): string {
@@ -99,12 +100,11 @@ function sanitizeQueryDetail(query?: string): string | undefined {
   }
 
   const withoutUrls = normalized.replace(/https?:\/\/\S+/gi, "").trim();
-  const compact = withoutUrls.trim();
-  if (!compact) {
+  if (!withoutUrls) {
     return undefined;
   }
 
-  const words = compact.split(/\s+/).slice(0, 6).join(" ");
+  const words = withoutUrls.split(/\s+/).slice(0, 6).join(" ");
   return truncateDetail(words, QUERY_DETAIL_MAX_LENGTH);
 }
 
@@ -157,6 +157,13 @@ export function buildTelegramFinalizingStatus(): TelegramRuntimeStatus {
   };
 }
 
+export function buildTelegramRepairingStatus(): TelegramRuntimeStatus {
+  return {
+    phase: "processing",
+    text: TELEGRAM_REPAIRING_STATUS_TEXT,
+  };
+}
+
 export function buildTelegramSendingStatus(): TelegramRuntimeStatus {
   return {
     phase: "sending",
@@ -190,6 +197,10 @@ export function mapProviderEventToTelegramStatus(
 ): TelegramRuntimeStatus | null {
   if (isLifecycleStartEvent(event)) {
     return buildTelegramRunningStatus();
+  }
+
+  if (event.type === "reply.repair.started") {
+    return buildTelegramRepairingStatus();
   }
 
   if (!isWorkItemEvent(event)) {

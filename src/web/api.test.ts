@@ -96,7 +96,7 @@ test("POST /sessions/:id/messages continues placeholder lookup replies before re
 
     if (calls.length === 1) {
       return {
-        text: "I will check that.",
+        text: "我先查一下公开信息，确认它到底是项目、产品还是网站。",
         sessionId: "thread_web_lookup_1",
       };
     }
@@ -155,7 +155,7 @@ test("POST /sessions/:id/messages/stream continues placeholder lookup replies be
 
     if (calls.length === 1) {
       return {
-        text: "I will check that.",
+        text: "我先查一下公开信息，确认它到底是项目、产品还是网站。",
         sessionId: "thread_web_stream_1",
       };
     }
@@ -187,7 +187,7 @@ test("POST /sessions/:id/messages/stream continues placeholder lookup replies be
   assert.equal(calls.length, 2);
   assert.ok(events.some((event) => event.type === "assistant" && event.content === "Tokyo is currently about 14°C with light wind."));
   assert.ok(events.some((event) => event.type === "done"));
-  assert.ok(!events.some((event) => event.type === "assistant" && event.content === "I will check that."));
+  assert.ok(!events.some((event) => event.type === "assistant" && event.content === "我先查一下公开信息，确认它到底是项目、产品还是网站。"));
 
   const stored = db.getSession(session.id);
   assert.ok(stored);

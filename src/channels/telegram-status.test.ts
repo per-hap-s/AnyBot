@@ -10,6 +10,7 @@ import {
   TELEGRAM_COMMAND_STATUS_TEXT,
   TELEGRAM_FILE_STATUS_TEXT,
   TELEGRAM_FINALIZING_STATUS_TEXT,
+  TELEGRAM_REPAIRING_STATUS_TEXT,
   TELEGRAM_RUNNING_STATUS_TEXT,
   TELEGRAM_TOOL_STATUS_TEXT,
   TELEGRAM_WEB_STATUS_TEXT,
@@ -58,7 +59,7 @@ test("mapProviderEventToTelegramStatus attaches sanitized detail for work events
 
   assert.equal(command?.phase, "processing");
   assert.equal(command?.text, `${TELEGRAM_COMMAND_STATUS_TEXT}：npm.cmd run`);
-  assert.equal(webSearch?.text, `${TELEGRAM_WEB_STATUS_TEXT}：Codex non-interactive json even...`);
+  assert.equal(webSearch?.text, `${TELEGRAM_WEB_STATUS_TEXT}：Codex non-interactive json ev...`);
   assert.equal(tool?.text, `${TELEGRAM_TOOL_STATUS_TEXT}：search_openai_docs`);
   assert.equal(fileChange?.text, TELEGRAM_FILE_STATUS_TEXT);
 });
@@ -92,6 +93,18 @@ test("mapProviderEventToTelegramStatus only finalizes on completed agent message
   assert.deepEqual(completed, {
     phase: "processing",
     text: TELEGRAM_FINALIZING_STATUS_TEXT,
+  });
+});
+
+test("mapProviderEventToTelegramStatus exposes repair-in-progress events", () => {
+  const repair = mapProviderEventToTelegramStatus({
+    type: "reply.repair.started",
+    itemType: "completion_repair",
+  });
+
+  assert.deepEqual(repair, {
+    phase: "processing",
+    text: TELEGRAM_REPAIRING_STATUS_TEXT,
   });
 });
 

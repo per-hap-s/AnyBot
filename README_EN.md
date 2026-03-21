@@ -1,12 +1,12 @@
 # AnyBot
 
-This minimized AnyBot build only supports:
+This minimized AnyBot build keeps the stack narrow on purpose:
 
-- `Codex CLI` as the only provider
-- `Feishu` and `Telegram` as messaging channels
-- The built-in `Web UI` for local chat and configuration
+- `Codex CLI` is the only main provider.
+- `Telegram`, `Feishu`, and the built-in `Web UI` are the active chat surfaces.
+- Telegram now has a durable V2 background-task path; Web and Feishu still use the existing foreground flow.
 
-The goal of this version is to stay minimal while supporting both:
+The goal is to stay small enough to operate locally while still supporting:
 
 - `npm start` for foreground service mode
 - a Windows tray host based on Electron for background management
@@ -17,10 +17,13 @@ The goal of this version is to stay minimal while supporting both:
 - Codex model switching
 - Feishu long-connection messaging
 - Feishu image input and file/image reply upload
-- Telegram private-chat polling, queue/supplement decisions, and final reply replacement
+- Telegram private-chat polling
+- Telegram durable background tasks with persisted queue, recovery, and supplement-or-queue decisions
 - Telegram mixed runtime status updates for long-running Codex tasks
+- Telegram query-completion repair for lookup-style turns
 - Local session persistence
 - Proxy configuration and connectivity test
+- Durable memory extraction, retrieval, rerank, and promotion
 
 ## What Was Removed
 
@@ -40,8 +43,8 @@ The goal of this version is to stay minimal while supporting both:
 
 1. Copy the env template:
 
-```bash
-cp .env.example .env
+```powershell
+Copy-Item .env.example .env
 ```
 
 2. Edit `.env` and set at least:
@@ -57,7 +60,7 @@ If `codex` is already available in PATH, you can leave `CODEX_BIN` empty or set 
 
 3. Install dependencies and start:
 
-```bash
+```powershell
 npm install
 npm start
 ```
@@ -70,7 +73,7 @@ http://localhost:19981
 
 ## Windows Tray Mode
 
-Tray mode is now the recommended Windows entrypoint. It starts and monitors the AnyBot service, exposes quick controls from the system tray, and supports launch-at-login.
+Tray mode is the recommended Windows entrypoint. It starts and monitors the AnyBot service, exposes quick controls from the system tray, and supports launch-at-login.
 
 The tray config file is stored at `.data/tray-config.json`. Set `serviceAutoStartDelaySeconds` to delay the post-login AnyBot auto-start, for example:
 
@@ -84,19 +87,19 @@ The tray config file is stored at `.data/tray-config.json`. Set `serviceAutoStar
 
 Development:
 
-```bash
+```powershell
 npm run dev:tray
 ```
 
 Local built tray:
 
-```bash
+```powershell
 npm run start:tray
 ```
 
 Windows installer:
 
-```bash
+```powershell
 npm run pack:win
 ```
 
@@ -134,39 +137,95 @@ Channel config is stored in `.data/channels.json`. Feishu and Telegram are suppo
 
 You can update this from the Web UI Telegram page or from the Windows tray menu.
 
+## Telegram V2 Background Tasks
+
+Telegram now runs on a durable task layer backed by SQLite:
+
+- Task state is persisted in `telegram_tasks`, `telegram_task_inputs`, `telegram_attempts`, and `telegram_poll_state`.
+- `node:test` now uses an isolated temporary runtime root, so tests no longer write into the real `.data/chat.db` or Telegram polling state.
+- Incoming Telegram messages are no longer represented only by in-memory `running / decision / queued / pendingRestart`.
+- On restart, Telegram polling resumes from the persisted `last_update_id + 1` instead of jumping to the latest offset.
+- A running attempt can be superseded by a newer revision; superseded attempts do not write shared session history or memory.
+
+Current V2 boundaries:
+
+- V2 only applies to `Telegram`.
+- `Web` and `Feishu` keep the existing foreground execution path.
+- The main execution provider is still `codex exec --json`.
+- V2 does not add mid-run steering of an existing provider process.
+
 ## Telegram Runtime Statuses
 
-Telegram now surfaces Codex runtime progress in a mixed status mode. The status message stays concise by default and only adds a short detail when it is useful, such as the command name, tool name, or search query.
+Telegram surfaces runtime progress in a mixed status mode. The status message stays concise by default and only adds a short sanitized detail when useful, such as a command name, tool name, or short search topic.
 
-Runtime phases:
+Runtime statuses:
 
 - `已收到消息`
+- `正在理解图片`
 - `正在理解问题`
 - `正在执行命令`
 - `正在搜索网页`
 - `正在调用工具`
 - `正在修改文件`
 - `正在整理回复`
+- `正在补全查询结果`
 - `正在发送回复`
 
-Status updates are throttled to avoid Telegram edit spam, older task attempts cannot overwrite the current run, and the processing text now follows the latest real activity instead of getting stuck on the first `正在整理回复`.
+Display rules:
+
+- File-change status does not expose long local file paths.
+- Command status only shows a short command summary, not full output.
+- Web search status only shows a short topic, not raw result bodies.
+- Older attempts cannot overwrite the current task status.
+- Status updates are throttled to avoid Telegram edit spam.
+- Processing text follows the latest real activity instead of getting stuck on the first finalizing event.
 
 ## Provider Timeout Behavior
 
 Codex runs now use two timeout guards:
 
 - `idleTimeoutMs = 120000`: fail only when there has been no effective provider progress for 120 seconds and there is no active long-running command / web search / MCP tool call / file change step
-- `maxRuntimeMs = 1800000`: absolute 30 minute ceiling for a single provider run
+- `maxRuntimeMs = 3600000`: absolute 60-minute ceiling for a single provider run
 
-Only `resume` runs that hit the idle timeout before producing any real progress are retried as a fresh session. Long single-step work is protected from idle timeout and falls back to the max runtime guard instead. This V1 implementation does not introduce a durable background queue and does not support mid-run steering of an existing `codex exec --json` process.
+Only `resume` runs that hit idle timeout before any real progress are retried as a fresh session. Long single-step work is protected from idle timeout and falls back to the max-runtime guard instead.
+
+Telegram failure text distinguishes:
+
+- idle timeout
+- max runtime
+- incomplete lookup failure
+- generic provider failure
+
+## Query Completion Guard
+
+Lookup-style turns cannot end on placeholder-only replies such as `I will check that.` or vague unresolved endings such as `Not sure.`.
+
+For those turns, AnyBot makes one in-session continuation attempt to force a usable closure. The next reply must do one of these:
+
+- provide the actual result
+- clearly explain why the result cannot be obtained right now
+
+Explicit failure replies are valid terminal outcomes. If the model still fails to provide either a result or a clear failure reason after the repair attempt, Telegram shows a user-visible failure message instead of storing a half-finished placeholder reply.
+
+## Telegram Supplement Router Sidecar
+
+Telegram V2 adds an optional supplement router sidecar for `supplement / queue / unclear` classification:
+
+- Hard rules run first.
+- Only gray-area cases call the sidecar model.
+- The sidecar path is isolated from the main Codex execution path.
+- Low-confidence, timeout, circuit-open, or invalid-output cases fall back to the manual Telegram choice instead of auto-routing.
+- The service reads explicit env vars only; it does not read Codex desktop `config.toml`.
+
+The default sidecar model is `gpt-5.4-mini`.
 
 ## Environment Variables
 
 ```env
 PROVIDER=codex
 CODEX_BIN=
-CODEX_MODEL=
-CODEX_SANDBOX=read-only
+CODEX_MODEL=gpt-5.4
+CODEX_SANDBOX=danger-full-access
 CODEX_SYSTEM_PROMPT=
 CODEX_WORKDIR=
 WEB_PORT=19981
@@ -179,6 +238,14 @@ SILICONFLOW_API_KEY=
 SILICONFLOW_EMBEDDING_MODEL=BAAI/bge-m3
 SILICONFLOW_EMBEDDING_URL=https://api.siliconflow.cn/v1/embeddings
 SILICONFLOW_EMBEDDING_TIMEOUT_MS=20000
+SILICONFLOW_RERANK_MODEL=BAAI/bge-reranker-v2-m3
+SILICONFLOW_RERANK_URL=https://api.siliconflow.cn/v1/rerank
+SILICONFLOW_RERANK_TIMEOUT_MS=20000
+TELEGRAM_ROUTER_ENABLED=false
+TELEGRAM_ROUTER_BASE_URL=
+TELEGRAM_ROUTER_API_KEY=
+TELEGRAM_ROUTER_MODEL=gpt-5.4-mini
+TELEGRAM_ROUTER_TIMEOUT_MS=2500
 ```
 
 Memory notes:
@@ -186,9 +253,16 @@ Memory notes:
 - Durable memory extraction runs asynchronously after a private-chat reply and defaults to `gpt-5.4`.
 - Canonical memory promotion also runs asynchronously and defaults to `gpt-5.4`.
 - New memory entries are embedded asynchronously through SiliconFlow with `BAAI/bge-m3`.
-- Memory indexing is currently limited to private chats (`web`, Feishu owner chat, Telegram owner chat).
-- Daily memory stays granular; duplicate merging is deferred to canonical-memory promotion.
-- Retrieval is enabled for canonical memory only; daily memory is not retrieved yet.
+- Retrieval uses canonical memory only and blends vector similarity, keyword overlap, confidence, recency, category hints, and a second-stage SiliconFlow rerank call.
+- If rerank is unavailable or fails, retrieval falls back to the coarse blended score instead of disabling memory recall entirely.
+
+## Owner Chat Commands
+
+- `/memory` shows structured-memory counts and category summary
+- `/memories` lists active canonical memories
+- `/remember <text>` saves a durable fact
+- `/profile <text>` saves a durable user/profile fact
+- `/forget <text>` rejects matching daily and canonical memories
 
 ## Main API Routes
 
@@ -211,7 +285,7 @@ Memory notes:
 
 ## Windows Notes
 
-This build now includes:
+This build includes:
 
 - foreground service mode via `npm start`
 - a Windows tray host with start, stop, restart, status, logs, and launch-at-login

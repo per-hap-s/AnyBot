@@ -125,4 +125,6 @@ export type {
   ChannelConfig,
   FeishuChannelConfig,
   TelegramChannelConfig,
+  TelegramTaskAttemptInput,
+  TelegramTaskAttemptResult,
 } from "./types.js";

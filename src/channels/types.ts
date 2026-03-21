@@ -37,6 +37,24 @@ export interface ModelInfo {
   isCurrent: boolean;
 }
 
+export interface TelegramTaskAttemptInput {
+  attemptId: string;
+  taskId: string;
+  chatId: string;
+  userText: string;
+  imagePaths?: string[];
+  sessionId?: string | null;
+  onEvent?: (event: ProviderRuntimeEvent) => void;
+  signal?: AbortSignal;
+  canPersist?: () => boolean;
+}
+
+export interface TelegramTaskAttemptResult {
+  text: string;
+  sessionId: string | null;
+  repairedIncompleteReply: boolean;
+}
+
 export interface ChannelCallbacks {
   generateReply: (
     chatId: string,
@@ -50,9 +68,12 @@ export interface ChannelCallbacks {
   listModels: () => ModelInfo[];
   switchModel: (modelId: string) => { success: boolean; message: string };
   getMemoryStatus: () => string;
+  listMemories: () => string;
   remember: (text: string) => Promise<{ success: boolean; message: string }>;
   updateProfile: (text: string) => Promise<{ success: boolean; message: string }>;
+  forgetMemory: (text: string) => Promise<{ success: boolean; message: string }>;
   compressMemory: () => Promise<{ success: boolean; message: string }>;
+  runTelegramTaskAttempt: (input: TelegramTaskAttemptInput) => Promise<TelegramTaskAttemptResult>;
 }
 
 export interface IChannel {

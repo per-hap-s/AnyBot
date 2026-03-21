@@ -39,6 +39,10 @@ export async function handleCommand(
     return { handled: true, reply: callbacks.getMemoryStatus() };
   }
 
+  if (trimmed === "/memories") {
+    return { handled: true, reply: callbacks.listMemories() };
+  }
+
   if (trimmed.startsWith("/remember ")) {
     const target = trimmed.slice("/remember ".length).trim();
     if (!target) {
@@ -54,6 +58,15 @@ export async function handleCommand(
       return { handled: true, reply: "Usage: /profile <durable user fact>" };
     }
     const result = await callbacks.updateProfile(target);
+    return { handled: true, reply: result.message };
+  }
+
+  if (trimmed.startsWith("/forget ")) {
+    const target = trimmed.slice("/forget ".length).trim();
+    if (!target) {
+      return { handled: true, reply: "Usage: /forget <memory text>" };
+    }
+    const result = await callbacks.forgetMemory(target);
     return { handled: true, reply: result.message };
   }
 
@@ -73,9 +86,11 @@ function formatHelp(): string {
     "/model - list Codex models",
     "/model <name> - switch model",
     "/memory - show memory status",
+    "/memories - list active canonical memories",
     "/remember <text> - save a durable memory note",
     "/profile <text> - save a durable profile fact",
-    "/compress-memory - compact MEMORY.md after explicit confirmation",
+    "/forget <text> - reject matching memories",
+    "/compress-memory - deprecated legacy command",
     "/help - show this help",
   ].join("\n");
 }
