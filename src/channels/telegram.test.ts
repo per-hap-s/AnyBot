@@ -1460,3 +1460,83 @@ test("TelegramChannel worker restarts a recovered queued task and completes a ne
   assert.equal(attempts[1]?.providerSessionIdAfter, "session_recovered_new");
   assert.equal(internal.getChatState(task.chatId).running, null);
 });
+
+test("TelegramChannel worker fails a recovered task cleanly when the chat is no longer valid", async () => {
+  const now = Date.now();
+  const channel = new TelegramChannel({
+    sendMessage: async () => {
+      throw new Error("Bad Request: chat not found");
+    },
+    editMessageText: async () => true as never,
+    deleteMessage: async () => true as never,
+    sendChatAction: async () => true as never,
+    commitReply: async () => {
+      throw new Error("commit should not run");
+    },
+  });
+
+  const task = createTask({
+    chatId: `recover_invalid_${now}`,
+    status: "queued",
+    currentRevision: 1,
+    currentPhase: "stable_running",
+    providerSessionId: null,
+  });
+  createTelegramTask(task);
+  createTelegramTaskInput(createTaskInput(task, 1, 1, "继续处理这个后台任务"));
+
+  const internal = channel as unknown as {
+    config: {
+      botToken: string;
+      ownerChatId: string;
+      privateOnly: boolean;
+      allowGroups: boolean;
+      pollingTimeoutSeconds: number;
+      finalReplyMode: "replace";
+    } | null;
+    callbacks: {
+      runTelegramTaskAttempt: (input: {
+        taskId: string;
+        userText: string;
+      }) => Promise<{
+        text: string;
+        sessionId: string | null;
+        repairedIncompleteReply: boolean;
+      }>;
+    } | null;
+    running: boolean;
+    tickWorker: () => Promise<void>;
+    getChatState: (chatId: string) => {
+      running: unknown;
+      decision: unknown;
+    };
+  };
+
+  internal.config = {
+    botToken: "test-token",
+    ownerChatId: task.chatId,
+    privateOnly: true,
+    allowGroups: false,
+    pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
+  };
+  internal.callbacks = {
+    runTelegramTaskAttempt: async () => {
+      throw new Error("provider should not run");
+    },
+  } as never;
+  internal.running = true;
+
+  await internal.tickWorker();
+  await delay(20);
+
+  const updatedTask = getTelegramTaskById(task.id);
+  const attempts = listTelegramAttemptsByTask(task.id);
+
+  assert.equal(updatedTask?.status, "failed");
+  assert.equal(updatedTask?.activeAttemptId, null);
+  assert.equal(attempts.length, 1);
+  assert.equal(attempts[0]?.status, "failed");
+  assert.match(attempts[0]?.errorText || "", /chat not found/i);
+  assert.equal(internal.getChatState(task.chatId).running, null);
+});

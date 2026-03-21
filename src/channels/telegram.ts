@@ -85,6 +85,10 @@ const TELEGRAM_IDLE_TIMEOUT_ERROR_TEXT = "本次任务因长时间无进展而�
 const TELEGRAM_MAX_RUNTIME_ERROR_TEXT = "本次任务已达到最长运行时长（60 分钟），请拆分任务后重试。";
 const TELEGRAM_GENERIC_ERROR_TEXT = "处理消息时出错了，请稍后再试。";
 
+function toErrorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 type StatusMessageTransport = {
   send: typeof sendTelegramMessage;
   edit: typeof editTelegramMessageText;
@@ -832,7 +836,15 @@ export class TelegramChannel implements IChannel {
         if (task.currentPhase === "merge_window" && Date.now() - task.updatedAt < MERGE_WINDOW_MS) {
           continue;
         }
-        await this.startTaskAttempt(task, state);
+        try {
+          await this.startTaskAttempt(task, state);
+        } catch (error) {
+          logger.error("telegram.task_attempt.start_failed", {
+            taskId: task.id,
+            chatId: task.chatId,
+            error,
+          });
+        }
       }
     } finally {
       this.workerRunning = false;
@@ -1258,34 +1270,70 @@ export class TelegramChannel implements IChannel {
     task.updatedAt = Date.now();
     updateTelegramTask(task);
 
-    const status = this.createStatusController(task.chatId, inputs[inputs.length - 1]!.telegramMessageId);
-    if (task.latestStatusMessageId) {
-      status.seedExisting(createPlaceholderTelegramMessage(task.chatId, task.latestStatusMessageId));
-    }
-    await status.show(TELEGRAM_RECEIVED_STATUS_TEXT, { clearKeyboard: true });
-    task.latestStatusMessageId = status.messageId;
-    updateTelegramTask(task);
+    try {
+      const status = this.createStatusController(task.chatId, inputs[inputs.length - 1]!.telegramMessageId);
+      if (task.latestStatusMessageId) {
+        status.seedExisting(createPlaceholderTelegramMessage(task.chatId, task.latestStatusMessageId));
+      }
+      await status.show(TELEGRAM_RECEIVED_STATUS_TEXT, { clearKeyboard: true });
+      task.latestStatusMessageId = status.messageId;
+      updateTelegramTask(task);
 
-    const abortController = new AbortController();
-    const runtimeStatusTracker = new TelegramRuntimeStatusTracker(
-      status,
-      () => this.running && this.getChatState(task.chatId).running?.attemptId === attempt.id,
-    );
-    state.running = {
-      taskId: task.id,
-      attemptId: attempt.id,
-      status,
-      abortController,
-      runtimeStatusTracker,
-    };
-
-    void this.executeTaskAttempt(task.id, attempt.id, status, runtimeStatusTracker, abortController.signal).catch((error) => {
-      logger.error("telegram.task_attempt.unhandled_failure", {
+      const abortController = new AbortController();
+      const runtimeStatusTracker = new TelegramRuntimeStatusTracker(
+        status,
+        () => this.running && this.getChatState(task.chatId).running?.attemptId === attempt.id,
+      );
+      state.running = {
         taskId: task.id,
         attemptId: attempt.id,
-        error,
+        status,
+        abortController,
+        runtimeStatusTracker,
+      };
+
+      void this.executeTaskAttempt(task.id, attempt.id, status, runtimeStatusTracker, abortController.signal).catch((error) => {
+        logger.error("telegram.task_attempt.unhandled_failure", {
+          taskId: task.id,
+          attemptId: attempt.id,
+          error,
+        });
       });
-    });
+    } catch (error) {
+      this.failTaskAttemptBeforeExecution(task.id, attempt.id, error);
+      throw error;
+    }
+  }
+
+  private failTaskAttemptBeforeExecution(taskId: string, attemptId: string, error: unknown): void {
+    const task = getTelegramTaskById(taskId);
+    const attempt = getTelegramAttemptById(attemptId);
+    const now = Date.now();
+
+    if (attempt) {
+      updateTelegramAttempt({
+        ...attempt,
+        status: "failed",
+        errorText: toErrorText(error),
+        finishedAt: now,
+        updatedAt: now,
+      });
+    }
+
+    if (task && task.activeAttemptId === attemptId) {
+      updateTelegramTask({
+        ...task,
+        activeAttemptId: null,
+        cancelRequestedAt: null,
+        status: "failed",
+        updatedAt: now,
+      });
+    }
+
+    const state = task ? this.getChatState(task.chatId) : null;
+    if (state?.running?.attemptId === attemptId) {
+      state.running = null;
+    }
   }
 
   private async executeTaskAttempt(
