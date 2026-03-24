@@ -2,6 +2,7 @@ import type { CodexJsonEvent } from "../types.js";
 import type { ProviderProgressKind, ProviderRuntimeEvent } from "./types.js";
 
 export const DEFAULT_PROVIDER_IDLE_TIMEOUT_MS = 120_000;
+export const DEFAULT_PROVIDER_LONG_STEP_STALL_TIMEOUT_MS = 600_000;
 export const DEFAULT_PROVIDER_MAX_RUNTIME_MS = 3_600_000;
 
 export const PROVIDER_PROGRESS_ITEM_TYPES = new Set([
@@ -9,6 +10,7 @@ export const PROVIDER_PROGRESS_ITEM_TYPES = new Set([
   "web_search",
   "mcp_tool_call",
   "file_change",
+  "todo_list",
   "plan_update",
   "reasoning",
   "agent_message",
@@ -147,6 +149,40 @@ function getAggregatedOutput(item: UnknownRecord | null): string | undefined {
   ]);
 }
 
+function getTodoSummary(item: UnknownRecord | null): Pick<ProviderRuntimeEvent, "todoCompleted" | "todoTotal" | "todoCurrentStep"> {
+  if (toTrimmedString(item?.type) !== "todo_list" || !Array.isArray(item?.items)) {
+    return {};
+  }
+
+  let todoTotal = 0;
+  let todoCompleted = 0;
+  let todoCurrentStep: string | undefined;
+
+  for (const entry of item.items) {
+    const todo = asRecord(entry);
+    if (!todo) {
+      continue;
+    }
+
+    todoTotal += 1;
+    const completed = todo.completed === true;
+    if (completed) {
+      todoCompleted += 1;
+      continue;
+    }
+
+    if (!todoCurrentStep) {
+      todoCurrentStep = firstString(todo, [["text"], ["content"], ["title"]]);
+    }
+  }
+
+  return {
+    todoCompleted: todoTotal > 0 ? todoCompleted : undefined,
+    todoTotal: todoTotal > 0 ? todoTotal : undefined,
+    todoCurrentStep,
+  };
+}
+
 function classifyProgressKind(type: string, itemType?: string): ProviderProgressKind {
   if (type === "turn.failed" || type === "error") {
     return "terminal";
@@ -167,6 +203,7 @@ function classifyProgressKind(type: string, itemType?: string): ProviderProgress
 export function normalizeProviderRuntimeEvent(event: CodexJsonEvent): ProviderRuntimeEvent {
   const item = getItem(event);
   const itemType = toTrimmedString(item?.type);
+  const todoSummary = getTodoSummary(item);
 
   return {
     type: toTrimmedString(event.type) || "unknown",
@@ -178,6 +215,7 @@ export function normalizeProviderRuntimeEvent(event: CodexJsonEvent): ProviderRu
     command: getCommand(item),
     toolName: getToolName(item),
     query: getQuery(item),
+    ...todoSummary,
     aggregatedOutputPreview: buildPreview(getAggregatedOutput(item), 120),
     progressKind: classifyProgressKind(toTrimmedString(event.type) || "unknown", itemType),
     raw: event,
@@ -211,4 +249,17 @@ export function shouldTriggerProviderIdleTimeout(
   }
 
   return now - lastProgressAt >= idleTimeoutMs;
+}
+
+export function shouldTriggerProviderLongStepStallTimeout(
+  lastRuntimeEventAt: number,
+  activeLongStepCount: number,
+  now: number,
+  longStepStallTimeoutMs: number,
+): boolean {
+  if (longStepStallTimeoutMs <= 0 || activeLongStepCount <= 0) {
+    return false;
+  }
+
+  return now - lastRuntimeEventAt >= longStepStallTimeoutMs;
 }

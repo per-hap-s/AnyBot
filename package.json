@@ -16,7 +16,7 @@
     "build": "npm run build:service && npm run build:tray",
     "check": "tsc -p tsconfig.service.json --noEmit && tsc -p tsconfig.tray.json --noEmit",
     "pack:win": "npm run build && electron-builder --win nsis",
-    "postinstall": "electron-builder install-app-deps"
+    "postinstall": "node scripts/postinstall.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.59.0",

@@ -10,6 +10,7 @@ import {
   ensureAssistantFiles,
 } from "../assistant-memory.js";
 import { createApp } from "../web/server.js";
+import { readWebAuthConfig } from "../web/auth.js";
 import {
   initProvider,
   getProvider,
@@ -102,6 +103,7 @@ function getProviderConfig(): Record<string, unknown> {
 const shouldLogContent = includeContentInLogs();
 const shouldLogPrompt = includePromptInLogs();
 const MAX_CHAT_SESSIONS = 200;
+const WEB_HOST = process.env.WEB_HOST?.trim() || "0.0.0.0";
 const WEB_PORT = parseInt(process.env.WEB_PORT || "19981", 10);
 const CODEX_STARTUP_TEXT_TIMEOUT_MS = 60_000;
 const CODEX_STARTUP_RESUME_TIMEOUT_MS = 90_000;
@@ -1116,6 +1118,7 @@ export class AnyBotService {
       app: "anybot",
       version: this.version,
       pid: process.pid,
+      webHost: WEB_HOST,
       webPort: WEB_PORT,
       provider: this.provider.type,
       currentModel: getCurrentModel(),
@@ -1386,7 +1389,9 @@ export class AnyBotService {
       sandbox: getSandbox(),
       logIncludeContent: shouldLogContent,
       logIncludePrompt: shouldLogPrompt,
+      webHost: WEB_HOST,
       webPort: WEB_PORT,
+      webAuthEnabled: Boolean(readWebAuthConfig()),
     });
 
     this.hydrateChannelSessions();
@@ -1409,15 +1414,16 @@ export class AnyBotService {
     const webApp = createApp({
       getStatus: () => this.getStatus(),
       controlToken: this.controlToken,
+      webAuth: readWebAuthConfig(),
       requestShutdown: () => {
         void this.shutdownAndExit("api");
       },
     });
 
     await new Promise<void>((resolve, reject) => {
-      const server = webApp.listen(WEB_PORT, () => {
-        logger.info("web.started", { port: WEB_PORT });
-        console.log(`AnyBot 界面： http://localhost:${WEB_PORT}`);
+      const server = webApp.listen(WEB_PORT, WEB_HOST, () => {
+        logger.info("web.started", { host: WEB_HOST, port: WEB_PORT });
+        console.log(`AnyBot 界面已监听： ${WEB_HOST}:${WEB_PORT}`);
         resolve();
       });
       server.once("error", (error) => {
@@ -1450,9 +1456,6 @@ export class AnyBotService {
     const categoryBackfill = db.backfillLegacyMemoryCategories();
     logger.info("memory.category_backfill.completed", categoryBackfill);
     this.memoryWorker.start();
-    if (db.listMemoryEntriesByScope(OWNER_PRIVATE_MEMORY_SCOPE).length > 0) {
-      enqueuePromotionJob(OWNER_PRIVATE_MEMORY_SCOPE, `startup:${this.startedAt}`);
-    }
     this.enqueueCanonicalEmbeddingBackfill(OWNER_PRIVATE_MEMORY_SCOPE);
   }
 

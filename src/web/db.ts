@@ -109,7 +109,7 @@ export type TelegramAttempt = {
   providerSessionIdAfter: string | null;
   hasLongStep: boolean;
   lastEventAt: number | null;
-  timeoutKind: "idle" | "max_runtime" | null;
+  timeoutKind: "idle" | "long_step_stalled" | "max_runtime" | null;
   resultText: string | null;
   errorText: string | null;
   startedAt: number | null;

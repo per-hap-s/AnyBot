@@ -53,6 +53,7 @@ Copy-Item .env.example .env
 PROVIDER=codex
 CODEX_BIN=C:\path\to\codex.exe
 CODEX_WORKDIR=D:\your\workspace
+WEB_HOST=127.0.0.1
 WEB_PORT=19981
 ```
 
@@ -70,6 +71,40 @@ Then open:
 ```text
 http://localhost:19981
 ```
+
+## VPS Deployment
+
+For the current VPS migration path, the production shape is:
+
+- run as the Linux user `openclaw`
+- use `node dist/service/index.js` instead of `npm start`
+- keep the existing Telegram bot token and migrate the current `.data/chat.db` state
+- point Codex CLI at the existing custom `Responses API` endpoint instead of official login/API
+- expose the Web UI on `0.0.0.0:19981` with built-in `Basic Auth`
+
+Recommended production env values:
+
+```env
+CODEX_HOME=/home/openclaw/.codex
+ANYBOT_RUNTIME_ROOT=/home/openclaw/.anybot
+CODEX_WORKDIR=/home/openclaw/.openclaw/workspace/anybot-rescue
+WEB_HOST=0.0.0.0
+WEB_PORT=19981
+ANYBOT_WEB_BASIC_AUTH_USER=your-user
+ANYBOT_WEB_BASIC_AUTH_PASSWORD=your-password
+LOG_TO_STDOUT=true
+```
+
+Note: the repo-local `.env` now acts only as a fallback source. Explicit external environment values such as `systemd Environment=` and `EnvironmentFile=` take precedence and are no longer overridden by `.env`.
+
+Production build and start:
+
+```powershell
+npm run build:service
+node dist/service/index.js
+```
+
+See [docs/anybot-vps-migration.md](/D:/CodexProjects/AnyBot/docs/anybot-vps-migration.md) for the full migration and staging flow.
 
 ## Windows Tray Mode
 
@@ -133,7 +168,7 @@ Channel config is stored in `.data/channels.json`. Feishu and Telegram are suppo
 `telegram.finalReplyMode` supports:
 
 - `replace`: replace the in-progress status message with the final answer
-- `replace_and_notify`: still replace in place, and also send a short reminder message to trigger a Telegram notification; the reminder auto-deletes after about 15 seconds
+- `replace_and_notify`: still replace in place, and also send a lighter reminder message (`上方回复已更新`) to trigger a Telegram notification; the reminder auto-deletes after about 15 seconds
 
 You can update this from the Web UI Telegram page or from the Windows tray menu.
 
@@ -156,7 +191,7 @@ Current V2 boundaries:
 
 ## Telegram Runtime Statuses
 
-Telegram surfaces runtime progress in a mixed status mode. The status message stays concise by default and only adds a short sanitized detail when useful, such as a command name, tool name, or short search topic.
+Telegram surfaces runtime progress in a mixed status mode. The status message stays concise by default and only adds a short sanitized detail when useful, such as a command name, tool name, short search topic, or a compact Codex plan summary.
 
 Runtime statuses:
 
@@ -170,28 +205,38 @@ Runtime statuses:
 - `正在整理回复`
 - `正在补全查询结果`
 - `正在发送回复`
+- `当前计划：2/5 已完成；当前步骤：正在检查代码` (only when Codex emits an internal `todo_list` / plan event)
 
 Display rules:
 
 - File-change status does not expose long local file paths.
 - Command status only shows a short command summary, not full output.
 - Web search status only shows a short topic, not raw result bodies.
+- Telegram prompts now lightly steer Codex toward short Chinese internal plan steps.
+- Plan status is normalized into natural Chinese stages such as `正在分析问题 / 正在查资料 / 正在检查代码 / 正在修改实现 / 正在整理结果`.
+- Plan status stays as a compact Chinese summary instead of exposing the full checklist or raw internal phrasing.
+- `已收到消息` and later running/timeout/sending states now reuse the same Telegram status bubble instead of splitting into two cards.
+- Telegram final replies are also normalized toward chat-style Chinese and strip local absolute paths, Markdown file links, and reference-code lists before sending.
+- Telegram also rewrites internal state names, class names, database names, and process-control terms into simpler user-facing Chinese, including the last remaining terms such as `cancelled`, `二选一决策`, and `中止控制器`.
+- Telegram final replies are expected to stay conclusion-first, with only a small amount of follow-up detail instead of long implementation-heavy prose.
 - Older attempts cannot overwrite the current task status.
 - Status updates are throttled to avoid Telegram edit spam.
 - Processing text follows the latest real activity instead of getting stuck on the first finalizing event.
 
 ## Provider Timeout Behavior
 
-Codex runs now use two timeout guards:
+Codex runs now use three timeout guards:
 
 - `idleTimeoutMs = 120000`: fail only when there has been no effective provider progress for 120 seconds and there is no active long-running command / web search / MCP tool call / file change step
+- `longStepStallTimeoutMs = 600000`: once a long-running step has started, fail it if there are no new JSON runtime events for 10 minutes
 - `maxRuntimeMs = 3600000`: absolute 60-minute ceiling for a single provider run
 
-Only `resume` runs that hit idle timeout before any real progress are retried as a fresh session. Long single-step work is protected from idle timeout and falls back to the max-runtime guard instead.
+Only `resume` runs that hit idle timeout before any real progress are retried as a fresh session. Long single-step work is protected from normal idle timeout, but it is still cut off if the long step goes silent for 10 minutes with no new runtime events.
 
 Telegram failure text distinguishes:
 
 - idle timeout
+- long-step stalled timeout
 - max runtime
 - incomplete lookup failure
 - generic provider failure
@@ -228,10 +273,17 @@ CODEX_MODEL=gpt-5.4
 CODEX_SANDBOX=danger-full-access
 CODEX_SYSTEM_PROMPT=
 CODEX_WORKDIR=
+CODEX_HOME=
+ANYBOT_RUNTIME_ROOT=
+WEB_HOST=0.0.0.0
 WEB_PORT=19981
+ANYBOT_WEB_BASIC_AUTH_USER=
+ANYBOT_WEB_BASIC_AUTH_PASSWORD=
+ANYBOT_WEB_BASIC_AUTH_REALM=AnyBot
 LOG_LEVEL=info
 LOG_INCLUDE_CONTENT=false
 LOG_INCLUDE_PROMPT=false
+LOG_TO_STDOUT=
 MEMORY_EXTRACTION_MODEL=gpt-5.4
 MEMORY_PROMOTION_MODEL=gpt-5.4
 SILICONFLOW_API_KEY=
@@ -263,6 +315,7 @@ Memory notes:
 - `/remember <text>` saves a durable fact
 - `/profile <text>` saves a durable user/profile fact
 - `/forget <text>` rejects matching daily and canonical memories
+- `Telegram /stop` stops all active tasks in the current Telegram chat, clears in-progress status bubbles, and keeps the current session context; Telegram groups also accept `/stop@BotUsername`
 
 ## Main API Routes
 
@@ -293,5 +346,6 @@ This build includes:
 
 Packaging caveat:
 
+- `postinstall` skips Electron rebuild on non-Windows hosts
 - `better-sqlite3` must be rebuilt against Electron before packaging
 - if `electron-builder install-app-deps` fails on Windows with `EPERM`, stop any running AnyBot process and run `npm install` again

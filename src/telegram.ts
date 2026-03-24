@@ -1,4 +1,4 @@
-import { readFile, stat, mkdtemp, writeFile } from "node:fs/promises";
+﻿import { readFile, stat, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Blob } from "node:buffer";
@@ -12,8 +12,10 @@ const TELEGRAM_API_BASE = "https://api.telegram.org";
 const TELEGRAM_DOWNLOAD_BASE = "https://api.telegram.org/file";
 const MAX_TELEGRAM_UPLOAD_BYTES = 49 * 1024 * 1024;
 const MAX_TELEGRAM_DRAFT_TEXT_LENGTH = 4096;
-const TELEGRAM_REPLY_REUSED_NOTIFICATION_TEXT = "AnyBot 已在上方更新回复。";
+export const TELEGRAM_REPLY_REUSED_NOTIFICATION_TEXT = "上方回复已更新";
 const TELEGRAM_REPLY_REUSED_NOTIFICATION_TTL_MS = 15_000;
+const TELEGRAM_REFERENCE_HEADER_PATTERN = /^\s*(?:参考代码|参考文件|对应代码位置|相关代码|代码位置)\s*[:：]?\s*$/u;
+const TELEGRAM_STANDALONE_REFERENCE_PATTERN = /^\s*(?:[-*•]\s*)?(?:[`"']?[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+[`"']?\s*)+$/u;
 
 export type TelegramChatType = "private" | "group" | "supergroup" | "channel";
 
@@ -137,6 +139,224 @@ export interface TelegramReplyCommitResult {
   reusedExistingMessage: boolean;
 }
 
+function isLocalPathTarget(value: string): boolean {
+  return /^(?:[a-zA-Z]:[\\/]|\/|\.{1,2}[\\/])/.test(value.trim());
+}
+
+function stripPathLocationSuffix(value: string): string {
+  return value.replace(/(#L\d+(?:C\d+)?)|:\d+(?::\d+)?$/u, "");
+}
+
+function basenameFromLocalTarget(value: string): string {
+  const cleaned = stripPathLocationSuffix(value).replace(/[\\/]+$/u, "");
+  const parts = cleaned.split(/[\\/]/u).filter(Boolean);
+  return parts[parts.length - 1] || cleaned;
+}
+
+function replaceLocalMarkdownLinks(line: string): { text: string; replaced: boolean } {
+  let replaced = false;
+  const text = line.replace(/\[([^\]]+)\]\(([^)\n]+)\)/gu, (full, label: string, target: string) => {
+    if (!isLocalPathTarget(target)) {
+      return full;
+    }
+    replaced = true;
+    const cleanLabel = label.trim();
+    return cleanLabel || basenameFromLocalTarget(target);
+  });
+  return { text, replaced };
+}
+
+function replaceBareLocalPaths(line: string): { text: string; replaced: boolean } {
+  let replaced = false;
+  const text = line.replace(
+    /(?:[a-zA-Z]:[\\/]|(?<!https?:)\/)(?:[^\s<>"')\]]+[\\/])*[^\s<>"')\]]+/gu,
+    (candidate: string) => {
+      if (!isLocalPathTarget(candidate)) {
+        return candidate;
+      }
+      replaced = true;
+      return basenameFromLocalTarget(candidate);
+    },
+  );
+  return { text, replaced };
+}
+
+function sanitizeTelegramReferenceLine(line: string): { text: string; removed: boolean; hadReference: boolean } {
+  const markdownReplaced = replaceLocalMarkdownLinks(line);
+  const pathReplaced = replaceBareLocalPaths(markdownReplaced.text);
+  const text = pathReplaced.text
+    .replace(/#L\d+(?:C\d+)?/gu, "")
+    .replace(/:(\d+)(?::\d+)?(?=$|\s|[，。；,;:：])/gu, "")
+    .replace(/\s{2,}/gu, " ")
+    .trim();
+  const hadReference = markdownReplaced.replaced || pathReplaced.replaced;
+
+  if (!hadReference) {
+    return { text: line, removed: false, hadReference: false };
+  }
+
+  if (!text || TELEGRAM_STANDALONE_REFERENCE_PATTERN.test(text)) {
+    return { text: "", removed: true, hadReference: true };
+  }
+
+  return { text, removed: false, hadReference: true };
+}
+
+export function sanitizeTelegramReferenceText(text: string): string {
+  const lines = text.replace(/\r\n/gu, "\n").split("\n");
+  const sanitizedLines: string[] = [];
+  let skippingReferenceBlock = false;
+
+  for (const rawLine of lines) {
+    const line = rawLine.trimEnd();
+
+    if (TELEGRAM_REFERENCE_HEADER_PATTERN.test(line)) {
+      skippingReferenceBlock = true;
+      continue;
+    }
+
+    const sanitized = sanitizeTelegramReferenceLine(line);
+    if (skippingReferenceBlock) {
+      if (!line.trim()) {
+        skippingReferenceBlock = false;
+        continue;
+      }
+      if (sanitized.hadReference || !sanitized.text) {
+        continue;
+      }
+      skippingReferenceBlock = false;
+    }
+
+    if (sanitized.removed) {
+      continue;
+    }
+
+    sanitizedLines.push(sanitized.text);
+  }
+
+  return sanitizedLines
+    .join("\n")
+    .replace(/^按现在代码/u, "按现在实现")
+    .replace(/^从实现上看/u, "从现在实现看")
+    .replace(/^\s*(?:参考代码|参考文件|对应实现)[:：]?\s*/u, "")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+}
+
+function stripTelegramBackticks(text: string): string {
+  return text.replace(/`([^`]+)`/gu, (_full, inner: string) => {
+    const token = inner.trim();
+    if (!token) {
+      return "";
+    }
+    if (/^\/[A-Za-z0-9_@-]+$/u.test(token)) {
+      return token;
+    }
+    if (/^stop$/iu.test(token)) {
+      return "/stop";
+    }
+    return token;
+  });
+}
+
+function normalizeTelegramStyleLine(line: string): string {
+  if (!line.trim()) {
+    return "";
+  }
+
+  const isBullet = /^[-*•]\s*/u.test(line);
+  let content = line.replace(/^[-*•]\s*/u, "").trim();
+
+  content = content
+    .replace(/\bdecision_pending\b/giu, "待决定")
+    .replace(/\bwaiting_next_attempt\b/giu, "等下一轮")
+    .replace(/\bqueued\b/giu, "排队中")
+    .replace(/\brunning\b/giu, "正在处理")
+    .replace(/\bcancelled\b/giu, "已取消")
+    .replace(/二选一决策/gu, "确认怎么处理")
+    .replace(/待你确认怎么处理的任务/gu, "等你确认怎么处理的任务")
+    .replace(/待你确认怎么处理/gu, "等你确认怎么处理")
+    .replace(/中止控制器/gu, "")
+    .replace(/中止当前执行（\s*）/gu, "直接中止当前执行")
+    .replace(/中止当前执行\s*\(\s*\)/gu, "直接中止当前执行")
+    .replace(/中止当前执行（[^）]*）/gu, "直接中止当前执行")
+    .replace(/\bAbortController\b/gu, "直接中止当前执行")
+    .replace(/\bprovider execution\b/giu, "这轮执行")
+    .replace(/\bprovider\b/giu, "这轮执行")
+    .replace(/\bsession\b/giu, "上下文")
+    .replace(/\bSQLite\b/gu, "本地任务记录")
+    .replace(/\bchat\b/giu, "聊天")
+    .replace(/当前这个\s*聊天/u, "当前聊天")
+    .replace(/作用范围只限当前聊天/u, "只影响当前聊天")
+    .replace(/\s{2,}/gu, " ")
+    .trim();
+
+  if (/^现在\s*\/?stop\s*的实现很直接[:：]/iu.test(content)) {
+    return "简单说：/stop 会停止当前聊天里的任务，但不会清空上下文。";
+  }
+
+  if (/^(按现在实现|从现在实现看)[，,:：]/u.test(content)) {
+    return content.replace(/^(按现在实现|从现在实现看)[，,:：]\s*/u, "简单说：");
+  }
+
+  if (/带机器人名/u.test(content) || (/别的 bot/u.test(content) && /\/stop/u.test(content))) {
+    return "- 如果带机器人名，也只会处理发给自己的 /stop。";
+  }
+
+  if (
+    /所有活跃任务/u.test(content)
+    || /覆盖.*(待决定|排队中|正在处理|等下一轮)/u.test(content)
+    || (/排队中/u.test(content) && /正在处理/u.test(content))
+  ) {
+    return "- 正在跑的会被中止，排队和待确认的也会一起取消。";
+  }
+
+  if (
+    /不会重置上下文/u.test(content)
+    || /不会清空上下文/u.test(content)
+    || (/直接中止当前执行/u.test(content) && /上下文/u.test(content))
+  ) {
+    return "- 它不会清空上下文，之后还能继续原来的会话。";
+  }
+
+  if (/Telegram 专用命令.*只影响当前聊天/u.test(content)) {
+    return isBullet ? "- 只会影响当前这个聊天里的任务。" : "简单说：/stop 会停止当前聊天里的任务，但不会清空上下文。";
+  }
+
+  return isBullet ? `- ${content}` : content;
+}
+
+export function normalizeTelegramReplyStyle(text: string): string {
+  const normalized = stripTelegramBackticks(text)
+    .replace(/^现在\s+(.+?)\s+的实现很直接[:：]\s*/u, "简单说：")
+    .replace(/^按现在实现[，,:：]\s*/u, "简单说：")
+    .replace(/^从现在实现看[，,:：]\s*/u, "简单说：")
+    .replace(/它是 Telegram 专用命令，作用范围只限当前(?:这个)?\s*聊天。?/u, "简单说：/stop 会停止当前聊天里的任务，但不会清空上下文。")
+    .replace(/简单说，/u, "简单说：")
+    .replace(/不会重置上下文/u, "不会清空上下文")
+    .replace(/不会重置 session/giu, "不会清空上下文");
+
+  const lines = normalized
+    .split("\n")
+    .map((line) => normalizeTelegramStyleLine(line))
+    .filter((line, index, allLines) => {
+      if (line) {
+        return true;
+      }
+      return index > 0 && index < allLines.length - 1 && Boolean(allLines[index - 1] || allLines[index + 1]);
+    });
+
+  return lines
+    .join("\n")
+    .replace(/简单说：\s*\/stop\s+会/u, "简单说：/stop 会")
+    .replace(/\n{3,}/gu, "\n\n")
+    .trim();
+}
+
+export function sanitizeTelegramReplyText(text: string): string {
+  return normalizeTelegramReplyStyle(sanitizeTelegramReferenceText(text));
+}
+
 function buildMethodUrl(botToken: string, method: string): string {
   return `${TELEGRAM_API_BASE}/bot${botToken}/${method}`;
 }
@@ -210,6 +430,19 @@ export async function getTelegramUpdates(
       allowed_updates: ["message", "callback_query"],
     },
     "Failed to fetch Telegram updates",
+    signal,
+  );
+}
+
+export async function getTelegramMe(
+  botToken: string,
+  signal?: AbortSignal,
+): Promise<TelegramUser> {
+  return telegramJsonRequest<TelegramUser>(
+    botToken,
+    "getMe",
+    {},
+    "Failed to fetch Telegram bot profile",
     signal,
   );
 }
@@ -406,7 +639,7 @@ function scheduleTelegramReminderCleanup(
 }
 
 function normalizeTelegramDraftText(text: string): string {
-  const normalized = text.trim() || "正在处理…";
+  const normalized = text.trim() || "正在处理...";
   if (normalized.length <= MAX_TELEGRAM_DRAFT_TEXT_LENGTH) {
     return normalized;
   }
@@ -591,6 +824,7 @@ export async function commitTelegramReply(
   },
 ): Promise<TelegramReplyCommitResult> {
   const payload = parseReplyPayload(reply, workdir);
+  payload.text = payload.text ? sanitizeTelegramReplyText(payload.text) : payload.text;
   const sentMessages: TelegramMessage[] = [];
   const isPureText = Boolean(payload.text)
     && payload.imagePaths.length === 0
@@ -679,3 +913,5 @@ export async function commitTelegramReply(
     reusedExistingMessage: false,
   };
 }
+
+

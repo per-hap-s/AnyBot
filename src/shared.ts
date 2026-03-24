@@ -31,6 +31,43 @@ function buildOutputContract(source: string): string {
   ].join("\n");
 }
 
+function buildTelegramRuntimeStatusGuidance(source: string): string {
+  if (source !== "telegram") {
+    return "";
+  }
+
+  return [
+    "Telegram runtime status guidance:",
+    "- If you generate internal plans, todo_list items, or stage checklists, prefer short Chinese phrases.",
+    "- Describe internal steps as user-readable stages instead of internal engineering jargon.",
+    "- Keep step names concise and avoid over-splitting the work.",
+    "",
+  ].join("\n");
+}
+
+function buildTelegramFinalReplyGuidance(source: string): string {
+  if (source !== "telegram") {
+    return "";
+  }
+
+  return [
+    "Telegram final reply guidance:",
+    "- Write a chat-style Chinese answer for the user, not a code review report.",
+    "- Start with the conclusion, then add only the minimum necessary explanation.",
+    "- Prefer one short paragraph or at most three flat bullets.",
+    "- Do not output local absolute paths, Markdown file links, or code reference lists.",
+    "- Do not expose internal state names, class names, database names, or process-control names.",
+    "- Keep user-facing commands such as /stop, but do not dump internal enums or object names.",
+    "- Do not add sections like 参考代码 / 参考文件 / 对应代码位置.",
+    "- Unless you actually need to send an attachment, do not mention file paths.",
+    "",
+  ].join("\n");
+}
+
+function buildTelegramGuidance(source: string): string {
+  return `${buildTelegramRuntimeStatusGuidance(source)}${buildTelegramFinalReplyGuidance(source)}`;
+}
+
 function formatMemoryContext(memoryContext?: string): string {
   const trimmed = memoryContext?.trim();
   return trimmed ? `Memory context:\n${trimmed}\n\n` : "";
@@ -43,7 +80,7 @@ export function buildFirstTurnPrompt(
 ): string {
   return `${getSystemPrompt()}
 
-${formatMemoryContext(memoryContext)}Output requirements:
+${formatMemoryContext(memoryContext)}${buildTelegramGuidance(source)}Output requirements:
 ${buildOutputContract(source)}
 
 User message:
@@ -60,7 +97,7 @@ export function buildResumePrompt(
 Additional requirements:
 ${buildResumeRules(workdir)}
 
-${formatMemoryContext(memoryContext)}Output requirements:
+${formatMemoryContext(memoryContext)}${buildTelegramGuidance(source)}Output requirements:
 ${buildOutputContract(source)}`;
 }
 

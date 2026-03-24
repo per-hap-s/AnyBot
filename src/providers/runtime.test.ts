@@ -8,16 +8,22 @@ import {
   shouldRetryFreshSessionAfterTimeout,
 } from "./codex.js";
 import {
+  DEFAULT_PROVIDER_LONG_STEP_STALL_TIMEOUT_MS,
   DEFAULT_PROVIDER_MAX_RUNTIME_MS,
   getProviderLongStepKey,
   isProviderLongStepItemType,
   isProviderProgressEvent,
   normalizeProviderRuntimeEvent,
   shouldTriggerProviderIdleTimeout,
+  shouldTriggerProviderLongStepStallTimeout,
 } from "./runtime.js";
 
 test("DEFAULT_PROVIDER_MAX_RUNTIME_MS defaults to 60 minutes", () => {
   assert.equal(DEFAULT_PROVIDER_MAX_RUNTIME_MS, 3_600_000);
+});
+
+test("DEFAULT_PROVIDER_LONG_STEP_STALL_TIMEOUT_MS defaults to 10 minutes", () => {
+  assert.equal(DEFAULT_PROVIDER_LONG_STEP_STALL_TIMEOUT_MS, 600_000);
 });
 
 test("normalizeProviderRuntimeEvent extracts command execution details", () => {
@@ -42,6 +48,28 @@ test("normalizeProviderRuntimeEvent extracts command execution details", () => {
   assert.equal(event.aggregatedOutputPreview, "line one line two");
   assert.equal(event.progressKind, "progress");
   assert.equal(isProviderProgressEvent(event), true);
+});
+
+test("normalizeProviderRuntimeEvent extracts todo list progress summary", () => {
+  const event = normalizeProviderRuntimeEvent({
+    type: "item.started",
+    item: {
+      id: "todo_1",
+      type: "todo_list",
+      items: [
+        { text: "确认用户想要的输出格式", completed: true },
+        { text: "整理一个最小两步计划", completed: true },
+        { text: "返回最终中文结果并避免展开清单", completed: false },
+      ],
+    },
+  });
+
+  assert.equal(event.itemId, "todo_1");
+  assert.equal(event.itemType, "todo_list");
+  assert.equal(event.todoCompleted, 2);
+  assert.equal(event.todoTotal, 3);
+  assert.equal(event.todoCurrentStep, "返回最终中文结果并避免展开清单");
+  assert.equal(event.progressKind, "progress");
 });
 
 test("normalizeProviderRuntimeEvent treats turn.completed as progress", () => {
@@ -74,6 +102,9 @@ test("long-running step helpers suppress idle timeout while a tracked step is ac
   assert.equal(getProviderLongStepKey(started), "cmd_1");
   assert.equal(shouldTriggerProviderIdleTimeout(0, 1, 120_001, 120_000), false);
   assert.equal(shouldTriggerProviderIdleTimeout(0, 0, 120_001, 120_000), true);
+  assert.equal(shouldTriggerProviderLongStepStallTimeout(0, 1, 599_999, 600_000), false);
+  assert.equal(shouldTriggerProviderLongStepStallTimeout(0, 1, 600_001, 600_000), true);
+  assert.equal(shouldTriggerProviderLongStepStallTimeout(0, 0, 600_001, 600_000), false);
 });
 
 test("shouldRetryFreshSessionAfterTimeout only allows idle timeouts with no progress", () => {
@@ -87,6 +118,10 @@ test("shouldRetryFreshSessionAfterTimeout only allows idle timeouts with no prog
   );
   assert.equal(
     shouldRetryFreshSessionAfterTimeout(new ProviderTimeoutError("max_runtime", 3_600_000, false)),
+    false,
+  );
+  assert.equal(
+    shouldRetryFreshSessionAfterTimeout(new ProviderTimeoutError("long_step_stalled", 600_000, true)),
     false,
   );
 });

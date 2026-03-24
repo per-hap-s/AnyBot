@@ -1,0 +1,26 @@
+[Unit]
+Description=AnyBot Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/openclaw/AnyBot
+Environment=HOME=/home/openclaw
+Environment=PATH=/home/openclaw/.npm-global/bin:/home/openclaw/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=ANYBOT_RUNTIME_ROOT=/home/openclaw/.anybot
+Environment=CODEX_HOME=/home/openclaw/.codex
+Environment=CODEX_WORKDIR=/home/openclaw/.openclaw/workspace/anybot-rescue
+Environment=WEB_HOST=0.0.0.0
+Environment=WEB_PORT=19981
+Environment=LOG_TO_STDOUT=true
+EnvironmentFile=%h/.openclaw/proxy.env
+EnvironmentFile=%h/.anybot/service.env
+ExecStart=/usr/bin/node /home/openclaw/AnyBot/dist/service/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

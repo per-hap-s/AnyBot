@@ -19,7 +19,7 @@ export async function handleCommand(
   }
 
   if (trimmed === "/help") {
-    return { handled: true, reply: formatHelp() };
+    return { handled: true, reply: formatHelp(source) };
   }
 
   if (trimmed === "/model") {
@@ -78,8 +78,8 @@ export async function handleCommand(
   return { handled: false };
 }
 
-function formatHelp(): string {
-  return [
+function formatHelp(source: string): string {
+  const lines = [
     "Available commands:",
     "",
     "/new - start a new session",
@@ -91,8 +91,14 @@ function formatHelp(): string {
     "/profile <text> - save a durable profile fact",
     "/forget <text> - reject matching memories",
     "/compress-memory - deprecated legacy command",
-    "/help - show this help",
-  ].join("\n");
+  ];
+
+  if (source === "telegram") {
+    lines.push("/stop - stop all active tasks in this Telegram chat");
+  }
+
+  lines.push("/help - show this help");
+  return lines.join("\n");
 }
 
 function formatModelList(callbacks: ChannelCallbacks): string {

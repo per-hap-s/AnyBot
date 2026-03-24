@@ -16,6 +16,7 @@ import {
   downloadTelegramFile,
   editTelegramMessageText,
   getLargestTelegramPhoto,
+  getTelegramMe,
   getTelegramUpdates,
   sendTelegramChatAction,
   sendTelegramMessage,
@@ -42,6 +43,7 @@ import {
   getTelegramPendingDecisionByChat,
   getTelegramPollState,
   getTelegramTaskById,
+  listActiveTelegramTasksByChat,
   listRecoverableTelegramTasks,
   listRunnableTelegramTasks,
   listTelegramTaskInputs,
@@ -58,9 +60,11 @@ import {
   findTelegramMessageRef,
 } from "../web/db.js";
 import {
+  buildTelegramPlanFallbackContext,
   buildTelegramImageStatus,
   getTelegramStatusPhaseRank,
   mapProviderEventToTelegramStatus,
+  type TelegramPlanFallbackContext,
   TELEGRAM_RECEIVED_STATUS_TEXT,
   TELEGRAM_SENDING_STATUS_TEXT,
   TELEGRAM_STATUS_UPDATE_THROTTLE_MS,
@@ -85,6 +89,10 @@ const TELEGRAM_IDLE_TIMEOUT_ERROR_TEXT = "本次任务因长时间无进展而�
 const TELEGRAM_MAX_RUNTIME_ERROR_TEXT = "本次任务已达到最长运行时长（60 分钟），请拆分任务后重试。";
 const TELEGRAM_GENERIC_ERROR_TEXT = "处理消息时出错了，请稍后再试。";
 
+const TELEGRAM_LONG_STEP_STALLED_ERROR_TEXT = "本次任务中的长步骤长时间没有任何新进展，已中止本轮并准备继续后续任务。";
+const TELEGRAM_STOPPED_TASKS_TEXT = "已停止当前聊天中的所有任务。";
+const TELEGRAM_NO_ACTIVE_TASKS_TEXT = "当前聊天中没有可停止的任务。";
+
 function toErrorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -106,6 +114,7 @@ const defaultStatusMessageTransport: StatusMessageTransport = {
 };
 
 type TelegramChannelDeps = {
+  getMe: typeof getTelegramMe;
   getUpdates: typeof getTelegramUpdates;
   sendMessage: typeof sendTelegramMessage;
   editMessageText: typeof editTelegramMessageText;
@@ -116,6 +125,7 @@ type TelegramChannelDeps = {
 };
 
 const defaultTelegramChannelDeps: TelegramChannelDeps = {
+  getMe: getTelegramMe,
   getUpdates: getTelegramUpdates,
   sendMessage: sendTelegramMessage,
   editMessageText: editTelegramMessageText,
@@ -282,6 +292,7 @@ export class TelegramRuntimeStatusTracker {
   private flushPromise: Promise<void> | null = null;
   private disposed = false;
   private stickyPreProcessingText: string | null = null;
+  private latestPlanContext: TelegramPlanFallbackContext | null = null;
 
   constructor(
     private readonly status: RuntimeStatusTarget,
@@ -299,7 +310,11 @@ export class TelegramRuntimeStatusTracker {
   }
 
   handleProviderEvent(event: ProviderRuntimeEvent): void {
-    const nextStatus = mapProviderEventToTelegramStatus(event);
+    const nextStatus = mapProviderEventToTelegramStatus(event, this.latestPlanContext || undefined);
+    const nextPlanContext = buildTelegramPlanFallbackContext(event);
+    if (nextPlanContext) {
+      this.latestPlanContext = nextPlanContext;
+    }
     if (!nextStatus || this.isStopped()) {
       return;
     }
@@ -565,9 +580,29 @@ function createPlaceholderTelegramMessage(chatId: string, messageId: number): Te
   } as TelegramMessage;
 }
 
-function isResetCommand(text: string): boolean {
+function normalizeTelegramCommandText(text: string, botUsername?: string | null): string {
   const trimmed = text.trim();
-  return trimmed === "/new" || trimmed === "/reset" || trimmed === "/start";
+  const match = trimmed.match(/^(\/[^\s@]+)@([^\s]+)([\s\S]*)$/);
+  if (!match) {
+    return trimmed;
+  }
+  const [, command, targetUsername, rest = ""] = match;
+  if (!botUsername || targetUsername.toLowerCase() !== botUsername.toLowerCase()) {
+    return "";
+  }
+  return `${command}${rest}`.trim();
+}
+
+function isBotSuffixedTelegramCommand(text: string): boolean {
+  return /^\/[^\s@]+@[^\s]+(?:\s|$)/.test(text.trim());
+}
+
+function isResetCommand(text: string): boolean {
+  return text === "/new" || text === "/reset" || text === "/start";
+}
+
+function isStopCommand(text: string): boolean {
+  return text === "/stop";
 }
 
 function shouldAutoMergeCurrentTask(task: TelegramTask): boolean {
@@ -632,6 +667,9 @@ export function getTelegramBatchFailureText(error: unknown): string {
     if (error.kind === "idle") {
       return TELEGRAM_IDLE_TIMEOUT_ERROR_TEXT;
     }
+    if (error.kind === "long_step_stalled") {
+      return TELEGRAM_LONG_STEP_STALLED_ERROR_TEXT;
+    }
     if (error.kind === "max_runtime") {
       return TELEGRAM_MAX_RUNTIME_ERROR_TEXT;
     }
@@ -675,6 +713,7 @@ export class TelegramChannel implements IChannel {
   private readonly chatStates = new Map<string, ChatState>();
   private readonly router = new TelegramRouterClient();
   private readonly deps: TelegramChannelDeps;
+  private botUsername: string | null = null;
 
   constructor(deps: Partial<TelegramChannelDeps> = {}) {
     this.deps = {
@@ -697,6 +736,14 @@ export class TelegramChannel implements IChannel {
     this.config = config;
     this.callbacks = callbacks;
     this.running = true;
+    this.botUsername = null;
+
+    try {
+      const me = await this.deps.getMe(config.botToken);
+      this.botUsername = me.username?.trim() || null;
+    } catch (error) {
+      logger.warn("telegram.bot_profile_fetch_failed", { error });
+    }
 
     this.hydrateOffset();
     this.recoverPersistedTelegramTasks();
@@ -738,6 +785,7 @@ export class TelegramChannel implements IChannel {
 
     this.chatStates.clear();
     this.pollLoopPromise = null;
+    this.botUsername = null;
     this.config = null;
     this.callbacks = null;
     logger.info("telegram.stopped");
@@ -911,17 +959,32 @@ export class TelegramChannel implements IChannel {
     const botToken = this.config!.botToken;
     const chatId = String(message.chat.id);
     const userText = getMessageText(message);
+    const normalizedUserText = userText ? normalizeTelegramCommandText(userText, this.botUsername) : "";
     const state = this.getChatState(chatId);
+
+    if (userText && !normalizedUserText && isBotSuffixedTelegramCommand(userText)) {
+      return;
+    }
 
     if (!message.photo?.length && !message.document && !userText) {
       await this.deps.sendMessage(botToken, message.chat.id, "请直接发送文字问题。");
       return;
     }
 
-    if (userText) {
-      const cmd = await handleCommand(userText, chatId, "telegram", this.callbacks!);
+    if (normalizedUserText) {
+      if (isStopCommand(normalizedUserText)) {
+        const stoppedTaskCount = await this.stopChatTasks(chatId, state);
+        await this.deps.sendMessage(
+          botToken,
+          message.chat.id,
+          stoppedTaskCount > 0 ? TELEGRAM_STOPPED_TASKS_TEXT : TELEGRAM_NO_ACTIVE_TASKS_TEXT,
+        );
+        return;
+      }
+
+      const cmd = await handleCommand(normalizedUserText, chatId, "telegram", this.callbacks!);
       if (cmd.handled) {
-        if (isResetCommand(userText)) {
+        if (isResetCommand(normalizedUserText)) {
           await this.resetChatState(chatId, state);
         }
         if (cmd.reply) {
@@ -1248,7 +1311,8 @@ export class TelegramChannel implements IChannel {
   }
 
   private async startTaskAttempt(task: TelegramTask, state: ChatState): Promise<void> {
-    const inputs = listTelegramTaskInputsUpToRevision(task.id, task.currentRevision);
+    const latestTask = getTelegramTaskById(task.id) || task;
+    const inputs = listTelegramTaskInputsUpToRevision(latestTask.id, latestTask.currentRevision);
     if (inputs.length === 0) {
       return;
     }
@@ -1256,11 +1320,11 @@ export class TelegramChannel implements IChannel {
     const attemptId = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     const attempt: TelegramAttempt = {
       id: attemptId,
-      taskId: task.id,
-      revision: task.currentRevision,
+      taskId: latestTask.id,
+      revision: latestTask.currentRevision,
       status: "running",
       inputSnapshotJson: JSON.stringify(inputs),
-      providerSessionIdBefore: task.providerSessionId,
+      providerSessionIdBefore: latestTask.providerSessionId,
       providerSessionIdAfter: null,
       hasLongStep: false,
       lastEventAt: null,
@@ -1274,20 +1338,34 @@ export class TelegramChannel implements IChannel {
     };
     createTelegramAttempt(attempt);
 
-    task.status = "running";
-    task.activeAttemptId = attempt.id;
-    task.currentPhase = "starting";
-    task.updatedAt = Date.now();
-    updateTelegramTask(task);
+    const runningTask: TelegramTask = {
+      ...latestTask,
+      status: "running",
+      activeAttemptId: attempt.id,
+      currentPhase: "starting",
+      updatedAt: Date.now(),
+    };
+    updateTelegramTask(runningTask);
+    task.status = runningTask.status;
+    task.activeAttemptId = runningTask.activeAttemptId;
+    task.currentPhase = runningTask.currentPhase;
+    task.updatedAt = runningTask.updatedAt;
 
     try {
-      const status = this.createStatusController(task.chatId, inputs[inputs.length - 1]!.telegramMessageId);
-      if (task.latestStatusMessageId) {
-        status.seedExisting(createPlaceholderTelegramMessage(task.chatId, task.latestStatusMessageId));
+      const latestStatusTask = getTelegramTaskById(task.id) || runningTask;
+      const status = this.createStatusController(latestStatusTask.chatId, inputs[inputs.length - 1]!.telegramMessageId);
+      const reusedStatusMessageId = latestStatusTask.latestStatusMessageId
+        ?? (state.running?.taskId === task.id ? state.running.status.messageId : null);
+      if (reusedStatusMessageId) {
+        status.seedExisting(createPlaceholderTelegramMessage(latestStatusTask.chatId, reusedStatusMessageId));
       }
       await status.show(TELEGRAM_RECEIVED_STATUS_TEXT, { clearKeyboard: true });
       task.latestStatusMessageId = status.messageId;
-      updateTelegramTask(task);
+      updateTelegramTask({
+        ...latestStatusTask,
+        latestStatusMessageId: status.messageId,
+        updatedAt: Date.now(),
+      });
 
       const abortController = new AbortController();
       const runtimeStatusTracker = new TelegramRuntimeStatusTracker(
@@ -1295,16 +1373,16 @@ export class TelegramChannel implements IChannel {
         () => this.running && this.getChatState(task.chatId).running?.attemptId === attempt.id,
       );
       state.running = {
-        taskId: task.id,
+        taskId: latestStatusTask.id,
         attemptId: attempt.id,
         status,
         abortController,
         runtimeStatusTracker,
       };
 
-      void this.executeTaskAttempt(task.id, attempt.id, status, runtimeStatusTracker, abortController.signal).catch((error) => {
+      void this.executeTaskAttempt(latestStatusTask.id, attempt.id, status, runtimeStatusTracker, abortController.signal).catch((error) => {
         logger.error("telegram.task_attempt.unhandled_failure", {
-          taskId: task.id,
+          taskId: latestStatusTask.id,
           attemptId: attempt.id,
           error,
         });
@@ -1601,11 +1679,51 @@ export class TelegramChannel implements IChannel {
       controller.seedExisting(createPlaceholderTelegramMessage(task.chatId, task.latestStatusMessageId));
     }
     await controller.show(text, { clearKeyboard: true });
+    task.latestStatusMessageId = controller.messageId;
+    task.updatedAt = Date.now();
     updateTelegramTask({
       ...task,
-      latestStatusMessageId: controller.messageId,
-      updatedAt: Date.now(),
+      latestStatusMessageId: task.latestStatusMessageId,
+      updatedAt: task.updatedAt,
     });
+  }
+
+  private async stopChatTasks(chatId: string, state: ChatState): Promise<number> {
+    const activeTasks = listActiveTelegramTasksByChat(chatId);
+    if (activeTasks.length === 0) {
+      return 0;
+    }
+
+    const liveStatusMessageIds = new Set<number>();
+    if (typeof state.decision?.status.messageId === "number") {
+      liveStatusMessageIds.add(state.decision.status.messageId);
+    }
+    if (typeof state.running?.status.messageId === "number") {
+      liveStatusMessageIds.add(state.running.status.messageId);
+    }
+
+    cancelTelegramTasksByChat(chatId, Date.now());
+    await cleanupTelegramChatState(state);
+
+    const residualStatusMessageIds = [...new Set(
+      activeTasks
+        .map((task) => task.latestStatusMessageId)
+        .filter((messageId): messageId is number => typeof messageId === "number" && !liveStatusMessageIds.has(messageId)),
+    )];
+
+    await Promise.allSettled(residualStatusMessageIds.map(async (messageId) => {
+      try {
+        await this.deps.deleteMessage(this.config!.botToken, Number(chatId), messageId);
+      } catch (error) {
+        logger.warn("telegram.stop.delete_status_failed", {
+          chatId,
+          messageId,
+          error,
+        });
+      }
+    }));
+
+    return activeTasks.length;
   }
 
   private async resetChatState(chatId: string, state: ChatState): Promise<void> {

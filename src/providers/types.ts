@@ -15,6 +15,7 @@ export interface RunOptions {
   sandbox?: SandboxMode;
   timeoutMs?: number;
   idleTimeoutMs?: number;
+  longStepStallTimeoutMs?: number;
   maxRuntimeMs?: number;
   signal?: AbortSignal;
   onEvent?: (event: ProviderRuntimeEvent) => void;
@@ -31,7 +32,7 @@ export interface ProviderCapabilities {
   sandbox: boolean;
 }
 
-export type ProviderTimeoutKind = "idle" | "max_runtime";
+export type ProviderTimeoutKind = "idle" | "long_step_stalled" | "max_runtime";
 
 export type ProviderProgressKind = "progress" | "terminal" | "informational";
 
@@ -45,6 +46,9 @@ export interface ProviderRuntimeEvent {
   command?: string;
   toolName?: string;
   query?: string;
+  todoCompleted?: number;
+  todoTotal?: number;
+  todoCurrentStep?: string;
   aggregatedOutputPreview?: string;
   progressKind?: ProviderProgressKind;
   raw?: unknown;

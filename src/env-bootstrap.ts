@@ -26,5 +26,5 @@ const envPath = path.join(appRoot, ".env");
 
 config({
   path: envPath,
-  override: true,
+  override: false,
 });

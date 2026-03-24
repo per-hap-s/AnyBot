@@ -15,25 +15,132 @@ const BYPASS_DOMAINS = [
 
 let currentProxyUrl: string | null = null;
 let originalDispatcher: Dispatcher | null = null;
+let currentProxyMode: "config" | "env" | "none" = "none";
+
+type ProxyEnvSnapshot = {
+  HTTP_PROXY?: string;
+  HTTPS_PROXY?: string;
+  ALL_PROXY?: string;
+  NO_PROXY?: string;
+  http_proxy?: string;
+  https_proxy?: string;
+  all_proxy?: string;
+  no_proxy?: string;
+};
+
+function captureProxyEnv(env: NodeJS.ProcessEnv = process.env): ProxyEnvSnapshot {
+  return {
+    HTTP_PROXY: env.HTTP_PROXY,
+    HTTPS_PROXY: env.HTTPS_PROXY,
+    ALL_PROXY: env.ALL_PROXY,
+    NO_PROXY: env.NO_PROXY,
+    http_proxy: env.http_proxy,
+    https_proxy: env.https_proxy,
+    all_proxy: env.all_proxy,
+    no_proxy: env.no_proxy,
+  };
+}
+
+function getProxyEnvUrl(snapshot: ProxyEnvSnapshot): string | null {
+  return snapshot.HTTPS_PROXY
+    || snapshot.https_proxy
+    || snapshot.HTTP_PROXY
+    || snapshot.http_proxy
+    || snapshot.ALL_PROXY
+    || snapshot.all_proxy
+    || null;
+}
+
+function hasProxyEnv(snapshot: ProxyEnvSnapshot): boolean {
+  return Boolean(getProxyEnvUrl(snapshot));
+}
+
+function getNoProxyValue(snapshot: ProxyEnvSnapshot): string | undefined {
+  return snapshot.NO_PROXY || snapshot.no_proxy;
+}
+
+function restoreProxyEnv(snapshot: ProxyEnvSnapshot): void {
+  for (const key of [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+  ] as const) {
+    const value = snapshot[key];
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}
+
+function createProxyDispatcherFromEnv(snapshot: ProxyEnvSnapshot): Dispatcher | null {
+  const proxyUrl = getProxyEnvUrl(snapshot);
+  if (!proxyUrl) {
+    return null;
+  }
+
+  return new EnvHttpProxyAgent({
+    httpProxy: snapshot.HTTP_PROXY || snapshot.http_proxy || proxyUrl,
+    httpsProxy: snapshot.HTTPS_PROXY || snapshot.https_proxy || proxyUrl,
+    noProxy: getNoProxyValue(snapshot),
+  });
+}
+
+const inheritedProxyEnv = captureProxyEnv();
+const inheritedProxyDispatcher = createProxyDispatcherFromEnv(inheritedProxyEnv);
+
+export function shouldPreserveExistingEnvProxy(
+  config: ProxyConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return !config.enabled && hasProxyEnv(captureProxyEnv(env));
+}
 
 export function applyProxy(config?: ProxyConfig): void {
   const cfg = config ?? readProxyConfig();
   const proxyUrl = getProxyUrl(cfg);
 
-  if (proxyUrl === currentProxyUrl) return;
-
-  if (!proxyUrl) {
-    if (originalDispatcher) {
-      setGlobalDispatcher(originalDispatcher);
-      logger.info("proxy.disabled");
+  if (proxyUrl) {
+    if (proxyUrl === currentProxyUrl && currentProxyMode === "config") {
+      return;
     }
-    currentProxyUrl = null;
-    setProxyEnvVars(null);
+  } else if (!cfg.enabled && currentProxyMode === "env" && hasProxyEnv(inheritedProxyEnv)) {
+    return;
+  } else if (!cfg.enabled && currentProxyMode === "none" && !hasProxyEnv(inheritedProxyEnv)) {
     return;
   }
 
   if (!originalDispatcher) {
     originalDispatcher = getGlobalDispatcher();
+  }
+
+  if (!proxyUrl) {
+    currentProxyUrl = null;
+    if (hasProxyEnv(inheritedProxyEnv) && inheritedProxyDispatcher) {
+      restoreProxyEnv(inheritedProxyEnv);
+      setGlobalDispatcher(inheritedProxyDispatcher);
+      currentProxyMode = "env";
+      logger.info("proxy.env_preserved", {
+        source: "environment",
+        proxyUrl: getProxyEnvUrl(inheritedProxyEnv),
+        noProxy: getNoProxyValue(inheritedProxyEnv) || null,
+      });
+      return;
+    }
+
+    if (originalDispatcher) {
+      setGlobalDispatcher(originalDispatcher);
+      logger.info("proxy.disabled");
+    }
+    currentProxyMode = "none";
+    setProxyEnvVars(null);
+    return;
   }
 
   const noProxy = BYPASS_DOMAINS.join(",");
@@ -46,6 +153,7 @@ export function applyProxy(config?: ProxyConfig): void {
     });
     setGlobalDispatcher(agent);
     currentProxyUrl = proxyUrl;
+    currentProxyMode = "config";
     setProxyEnvVars(proxyUrl, noProxy);
     logger.info("proxy.applied", {
       protocol: cfg.protocol,

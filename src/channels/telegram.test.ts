@@ -24,6 +24,7 @@ import {
   listTelegramAttemptsByTask,
   listTelegramTaskInputs,
   saveTelegramPollState,
+  updateTelegramTask,
   type TelegramAttempt,
   type TelegramTask,
   type TelegramTaskInput,
@@ -303,6 +304,13 @@ test("getTelegramBatchFailureText distinguishes incomplete reply, timeouts, and 
   assert.equal(
     getTelegramBatchFailureText(new Error("boom")),
     "处理消息时出错了，请稍后再试。",
+  );
+});
+
+test("getTelegramBatchFailureText maps long-step stall timeout", () => {
+  assert.equal(
+    getTelegramBatchFailureText(new ProviderTimeoutError("long_step_stalled", 600_000, true)),
+    "本次任务中的长步骤长时间没有任何新进展，已中止本轮并准备继续后续任务。",
   );
 });
 
@@ -1557,4 +1565,680 @@ test("TelegramChannel worker fails a recovered task cleanly when the chat is no 
   assert.equal(attempts[0]?.status, "failed");
   assert.match(attempts[0]?.errorText || "", /chat not found/i);
   assert.equal(internal.getChatState(task.chatId).running, null);
+});
+
+test("ensureTaskStatusMessage syncs latestStatusMessageId back to the task object", async () => {
+  let sentMessageId = 1200;
+  const channel = new TelegramChannel({
+    sendMessage: async (_botToken, chatId, text) => ({
+      message_id: sentMessageId++,
+      date: Math.floor(Date.now() / 1000),
+      text,
+      chat: {
+        id: Number(chatId),
+        type: "private",
+      },
+    } as TelegramMessage),
+    editMessageText: async () => true as never,
+    deleteMessage: async () => true as never,
+  });
+
+  const task = createTask({
+    chatId: `status_sync_${Date.now()}`,
+    latestStatusMessageId: null,
+  });
+  createTelegramTask(task);
+
+  const internal = channel as unknown as {
+    config: { botToken: string } | null;
+    ensureTaskStatusMessage: (task: TelegramTask, replyToMessageId: number, text: string) => Promise<void>;
+  };
+  internal.config = { botToken: "test-token" };
+
+  await internal.ensureTaskStatusMessage(task, 42, TELEGRAM_RECEIVED_STATUS_TEXT);
+
+  const storedTask = getTelegramTaskById(task.id);
+  assert.equal(task.latestStatusMessageId, 1200);
+  assert.equal(storedTask?.latestStatusMessageId, 1200);
+});
+
+test("startTaskAttempt reuses the persisted status message when the passed task snapshot is stale", async () => {
+  let sendCalls = 0;
+  let editCalls = 0;
+  const channel = new TelegramChannel({
+    sendMessage: async (_botToken, chatId, text) => {
+      sendCalls += 1;
+      return {
+        message_id: 1300 + sendCalls,
+        date: Math.floor(Date.now() / 1000),
+        text,
+        chat: {
+          id: Number(chatId),
+          type: "private",
+        },
+      } as TelegramMessage;
+    },
+    editMessageText: async () => {
+      editCalls += 1;
+      return true as never;
+    },
+    deleteMessage: async () => true as never,
+    sendChatAction: async () => true as never,
+    commitReply: async () => {
+      throw new Error("commit should not run");
+    },
+  });
+
+  const task = createTask({
+    chatId: `stale_status_${Date.now()}`,
+    status: "queued",
+    currentRevision: 1,
+    currentPhase: "stable_running",
+    latestStatusMessageId: null,
+  });
+  createTelegramTask(task);
+  createTelegramTaskInput(createTaskInput(task, 1, 1, "继续处理这个任务"));
+  updateTelegramTask({
+    ...task,
+    latestStatusMessageId: 1888,
+    updatedAt: Date.now(),
+  });
+
+  const internal = channel as unknown as {
+    config: {
+      botToken: string;
+      ownerChatId: string;
+      privateOnly: boolean;
+      allowGroups: boolean;
+      pollingTimeoutSeconds: number;
+      finalReplyMode: "replace";
+    } | null;
+    callbacks: {} | null;
+    running: boolean;
+    startTaskAttempt: (task: TelegramTask, state: { running: unknown; decision: unknown }) => Promise<void>;
+    executeTaskAttempt: () => Promise<void>;
+    getChatState: (chatId: string) => {
+      running: unknown;
+      decision: unknown;
+    };
+  };
+
+  internal.config = {
+    botToken: "test-token",
+    ownerChatId: task.chatId,
+    privateOnly: true,
+    allowGroups: false,
+    pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
+  };
+  internal.callbacks = {} as never;
+  internal.running = true;
+  internal.executeTaskAttempt = async () => {};
+
+  const state = internal.getChatState(task.chatId);
+  await internal.startTaskAttempt(task, state);
+  await delay(20);
+
+  const storedTask = getTelegramTaskById(task.id);
+  assert.equal(sendCalls, 0);
+  assert.equal(editCalls, 1);
+  assert.equal(task.latestStatusMessageId, 1888);
+  assert.equal(storedTask?.latestStatusMessageId, 1888);
+});
+
+test("TelegramChannel long-step stall re-queues a waiting next revision", async () => {
+  const channel = new TelegramChannel({
+    sendMessage: async (_botToken, chatId, text) => ({
+      message_id: 1000,
+      date: Math.floor(Date.now() / 1000),
+      text,
+      chat: {
+        id: Number(chatId),
+        type: "private",
+      },
+    } as TelegramMessage),
+    editMessageText: async () => true as never,
+    deleteMessage: async () => true as never,
+    sendChatAction: async () => true as never,
+    commitReply: async (_botToken, chatId, text) => ({
+      reusedExistingMessage: true,
+      messages: [{
+        message_id: 1001,
+        date: Math.floor(Date.now() / 1000),
+        text,
+        chat: {
+          id: Number(chatId),
+          type: "private",
+        },
+      } as TelegramMessage],
+    }),
+  });
+  const now = Date.now();
+  const task = createTask({
+    chatId: `stall_requeue_${now}`,
+    status: "waiting_next_attempt",
+    currentRevision: 2,
+    currentPhase: "stable_running",
+  });
+  const revisionOneInput = createTaskInput(task, 1, 1, "继续原任务");
+  const attempt = createAttempt(task, {
+    revision: 1,
+    status: "running",
+    hasLongStep: true,
+    inputSnapshotJson: JSON.stringify([revisionOneInput]),
+  });
+  task.activeAttemptId = attempt.id;
+
+  createTelegramTask(task);
+  createTelegramAttempt(attempt);
+  createTelegramTaskInput(revisionOneInput);
+  createTelegramTaskInput(createTaskInput(task, 2, 1, "补充一个边界条件"));
+
+  const shown: string[] = [];
+  const status = {
+    currentMessage: createTelegramMessage(999),
+    show: async (text: string) => {
+      shown.push(text);
+    },
+    delete: async () => {},
+  } as unknown as StatusMessageController;
+
+  const internal = channel as unknown as {
+    config: {
+      botToken: string;
+      ownerChatId: string;
+      privateOnly: boolean;
+      allowGroups: boolean;
+      pollingTimeoutSeconds: number;
+      finalReplyMode: "replace";
+    } | null;
+    callbacks: {
+      runTelegramTaskAttempt: (input: {
+        taskId: string;
+        userText: string;
+      }) => Promise<{
+        text: string;
+        sessionId: string | null;
+        repairedIncompleteReply: boolean;
+      }>;
+    } | null;
+    running: boolean;
+    executeTaskAttempt: (
+      taskId: string,
+      attemptId: string,
+      status: StatusMessageController,
+      runtimeStatusTracker: TelegramRuntimeStatusTracker,
+      signal: AbortSignal,
+    ) => Promise<void>;
+    tickWorker: () => Promise<void>;
+    getChatState: (chatId: string) => {
+      running: unknown;
+      decision: unknown;
+    };
+  };
+
+  internal.config = {
+    botToken: "test-token",
+    ownerChatId: task.chatId,
+    privateOnly: true,
+    allowGroups: false,
+    pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
+  };
+
+  let runCount = 0;
+  internal.callbacks = {
+    runTelegramTaskAttempt: async (input: { userText: string }) => {
+      runCount += 1;
+      if (runCount === 1) {
+        assert.equal(input.userText, "继续原任务");
+        throw new ProviderTimeoutError("long_step_stalled", 600_000, true);
+      }
+
+      assert.match(input.userText, /补充一个边界条件/);
+      return {
+        text: "已根据补充继续执行",
+        sessionId: "session_after_stall",
+        repairedIncompleteReply: false,
+      };
+    },
+  } as never;
+  internal.running = true;
+
+  const runtimeStatusTracker = new TelegramRuntimeStatusTracker(status, () => true, 0);
+  const state = internal.getChatState(task.chatId);
+  state.running = {
+    taskId: task.id,
+    attemptId: attempt.id,
+    status,
+    abortController: new AbortController(),
+    runtimeStatusTracker,
+  } as never;
+
+  await internal.executeTaskAttempt(task.id, attempt.id, status, runtimeStatusTracker, new AbortController().signal);
+
+  const requeuedTask = getTelegramTaskById(task.id);
+  const failedAttempt = getTelegramAttemptById(attempt.id);
+
+  assert.equal(failedAttempt?.status, "failed");
+  assert.equal(failedAttempt?.timeoutKind, "long_step_stalled");
+  assert.equal(requeuedTask?.status, "queued");
+  assert.equal(requeuedTask?.activeAttemptId, null);
+  assert.deepEqual(shown, ["本次任务中的长步骤长时间没有任何新进展，已中止本轮并准备继续后续任务。"]);
+
+  await internal.tickWorker();
+  await delay(20);
+
+  const updatedTask = getTelegramTaskById(task.id);
+  const attempts = listTelegramAttemptsByTask(task.id);
+  const completedAttempt = attempts.find((item) => item.status === "completed");
+
+  assert.equal(runCount, 2);
+  assert.equal(updatedTask?.status, "completed");
+  assert.equal(updatedTask?.providerSessionId, "session_after_stall");
+  assert.equal(attempts.length, 2);
+  assert.equal(completedAttempt?.revision, 2);
+  assert.equal(completedAttempt?.status, "completed");
+});
+
+test("TelegramChannel /stop cancels all active tasks in the current chat, aborts running work, and keeps the session", async () => {
+  const deletedMessageIds: number[] = [];
+  const sentTexts: string[] = [];
+  const chatId = `${Date.now()}`.slice(-9);
+  const otherChatId = `${Number(chatId) + 1}`;
+  const channel = new TelegramChannel({
+    sendMessage: async (_botToken, tgChatId, text) => {
+      sentTexts.push(`${tgChatId}:${text}`);
+      return {
+        message_id: 7000 + sentTexts.length,
+        date: Math.floor(Date.now() / 1000),
+        text,
+        chat: { id: Number(tgChatId), type: "private" },
+      } as TelegramMessage;
+    },
+    editMessageText: async () => true as never,
+    deleteMessage: async (_botToken, _tgChatId, messageId) => {
+      deletedMessageIds.push(messageId);
+      return true as never;
+    },
+  });
+
+  const runningTask = createTask({
+    chatId,
+    status: "running",
+    activeAttemptId: `attempt_running_${Date.now()}`,
+    latestStatusMessageId: 8101,
+    currentPhase: "stable_running",
+  });
+  const queuedTask = createTask({
+    chatId,
+    status: "queued",
+    latestStatusMessageId: 8102,
+  });
+  const decisionTask = createTask({
+    chatId,
+    status: "decision_pending",
+    decisionStatus: "pending",
+    latestStatusMessageId: 8103,
+  });
+  const waitingTask = createTask({
+    chatId,
+    status: "waiting_next_attempt",
+    latestStatusMessageId: 8104,
+  });
+  const otherTask = createTask({
+    chatId: otherChatId,
+    status: "running",
+    latestStatusMessageId: 9101,
+  });
+
+  createTelegramTask(runningTask);
+  createTelegramTask(queuedTask);
+  createTelegramTask(decisionTask);
+  createTelegramTask(waitingTask);
+  createTelegramTask(otherTask);
+
+  let resetCount = 0;
+  let disposeCount = 0;
+  let abortCount = 0;
+  let decisionDeleteCount = 0;
+  let runningDeleteCount = 0;
+  const abortController = new AbortController();
+  const originalAbort = abortController.abort.bind(abortController);
+  abortController.abort = () => {
+    abortCount += 1;
+    originalAbort();
+  };
+
+  const internal = channel as unknown as {
+    config: {
+      botToken: string;
+      ownerChatId: string;
+      privateOnly: boolean;
+      allowGroups: boolean;
+      pollingTimeoutSeconds: number;
+      finalReplyMode: "replace";
+    } | null;
+    callbacks: object | null;
+    getChatState: (taskChatId: string) => {
+      running: unknown;
+      decision: unknown;
+    };
+    handleIncomingMessage: (message: TelegramMessage) => Promise<void>;
+  };
+
+  internal.config = {
+    botToken: "test-token",
+    ownerChatId: chatId,
+    privateOnly: true,
+    allowGroups: false,
+    pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
+  };
+  internal.callbacks = {
+    generateReply: async () => "",
+    resetSession: () => {
+      resetCount += 1;
+    },
+    listModels: () => [],
+    switchModel: () => ({ success: true, message: "" }),
+    getMemoryStatus: () => "",
+    listMemories: () => "",
+    remember: async () => ({ success: true, message: "" }),
+    updateProfile: async () => ({ success: true, message: "" }),
+    forgetMemory: async () => ({ success: true, message: "" }),
+    compressMemory: async () => ({ success: true, message: "" }),
+    runTelegramTaskAttempt: async () => ({
+      text: "",
+      sessionId: null,
+      repairedIncompleteReply: false,
+    }),
+  };
+
+  const state = internal.getChatState(chatId);
+  state.running = {
+    taskId: runningTask.id,
+    attemptId: runningTask.activeAttemptId,
+    status: {
+      messageId: 8101,
+      delete: async () => {
+        runningDeleteCount += 1;
+      },
+    },
+    abortController,
+    runtimeStatusTracker: {
+      dispose: () => {
+        disposeCount += 1;
+      },
+    },
+  } as never;
+  state.decision = {
+    taskId: decisionTask.id,
+    status: {
+      messageId: 8103,
+      delete: async () => {
+        decisionDeleteCount += 1;
+      },
+    },
+  } as never;
+
+  await internal.handleIncomingMessage({
+    message_id: 8999,
+    date: Math.floor(Date.now() / 1000),
+    text: "/stop",
+    chat: { id: Number(chatId), type: "private" },
+  } as TelegramMessage);
+
+  assert.equal(getTelegramTaskById(runningTask.id)?.status, "cancelled");
+  assert.equal(getTelegramTaskById(queuedTask.id)?.status, "cancelled");
+  assert.equal(getTelegramTaskById(decisionTask.id)?.status, "cancelled");
+  assert.equal(getTelegramTaskById(waitingTask.id)?.status, "cancelled");
+  assert.equal(getTelegramTaskById(otherTask.id)?.status, "running");
+  assert.equal(abortCount, 1);
+  assert.equal(disposeCount, 1);
+  assert.equal(runningDeleteCount, 1);
+  assert.equal(decisionDeleteCount, 1);
+  assert.equal(resetCount, 0);
+  assert.deepEqual(deletedMessageIds.sort((a, b) => a - b), [8102, 8104]);
+  assert.match(sentTexts[sentTexts.length - 1] || "", /已停止|停止/);
+});
+
+test("TelegramChannel /stop reports when there are no active tasks in the current chat", async () => {
+  const sentTexts: string[] = [];
+  const chatId = `990${Math.floor(Math.random() * 1_000_000).toString().padStart(6, "0")}`;
+  const channel = new TelegramChannel({
+    sendMessage: async (_botToken, tgChatId, text) => {
+      sentTexts.push(`${tgChatId}:${text}`);
+      return {
+        message_id: 7100 + sentTexts.length,
+        date: Math.floor(Date.now() / 1000),
+        text,
+        chat: { id: Number(tgChatId), type: "private" },
+      } as TelegramMessage;
+    },
+  });
+
+  const internal = channel as unknown as {
+    config: {
+      botToken: string;
+      ownerChatId: string;
+      privateOnly: boolean;
+      allowGroups: boolean;
+      pollingTimeoutSeconds: number;
+      finalReplyMode: "replace";
+    } | null;
+    botUsername: string | null;
+    callbacks: object | null;
+    handleIncomingMessage: (message: TelegramMessage) => Promise<void>;
+  };
+
+  internal.config = {
+    botToken: "test-token",
+    ownerChatId: chatId,
+    privateOnly: true,
+    allowGroups: false,
+    pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
+  };
+  internal.botUsername = "TestBot";
+  internal.callbacks = {
+    generateReply: async () => "",
+    resetSession: () => {},
+    listModels: () => [],
+    switchModel: () => ({ success: true, message: "" }),
+    getMemoryStatus: () => "",
+    listMemories: () => "",
+    remember: async () => ({ success: true, message: "" }),
+    updateProfile: async () => ({ success: true, message: "" }),
+    forgetMemory: async () => ({ success: true, message: "" }),
+    compressMemory: async () => ({ success: true, message: "" }),
+    runTelegramTaskAttempt: async () => ({
+      text: "",
+      sessionId: null,
+      repairedIncompleteReply: false,
+    }),
+  };
+
+  await internal.handleIncomingMessage({
+    message_id: 9000,
+    date: Math.floor(Date.now() / 1000),
+    text: "/stop",
+    chat: { id: Number(chatId), type: "private" },
+  } as TelegramMessage);
+
+  assert.match(sentTexts[0] || "", /没有.*停止|no active/i);
+});
+
+test("TelegramChannel normalizes bot-suffixed Telegram commands including /stop and /help", async () => {
+  const sentTexts: string[] = [];
+  const deletedMessageIds: number[] = [];
+  const chatId = `${Date.now()}`.slice(-9);
+  const channel = new TelegramChannel({
+    sendMessage: async (_botToken, tgChatId, text) => {
+      sentTexts.push(`${tgChatId}:${text}`);
+      return {
+        message_id: 7200 + sentTexts.length,
+        date: Math.floor(Date.now() / 1000),
+        text,
+        chat: { id: Number(tgChatId), type: "supergroup" },
+      } as TelegramMessage;
+    },
+    deleteMessage: async (_botToken, _tgChatId, messageId) => {
+      deletedMessageIds.push(messageId);
+      return true as never;
+    },
+  });
+
+  const queuedTask = createTask({
+    chatId,
+    status: "queued",
+    latestStatusMessageId: 8201,
+  });
+  createTelegramTask(queuedTask);
+
+  const internal = channel as unknown as {
+    config: {
+      botToken: string;
+      ownerChatId: string;
+      privateOnly: boolean;
+      allowGroups: boolean;
+      pollingTimeoutSeconds: number;
+      finalReplyMode: "replace";
+    } | null;
+    botUsername: string | null;
+    callbacks: object | null;
+    handleIncomingMessage: (message: TelegramMessage) => Promise<void>;
+  };
+
+  internal.config = {
+    botToken: "test-token",
+    ownerChatId: chatId,
+    privateOnly: false,
+    allowGroups: true,
+    pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
+  };
+  internal.botUsername = "TestBot";
+  internal.callbacks = {
+    generateReply: async () => "",
+    resetSession: () => {},
+    listModels: () => [],
+    switchModel: () => ({ success: true, message: "" }),
+    getMemoryStatus: () => "",
+    listMemories: () => "",
+    remember: async () => ({ success: true, message: "" }),
+    updateProfile: async () => ({ success: true, message: "" }),
+    forgetMemory: async () => ({ success: true, message: "" }),
+    compressMemory: async () => ({ success: true, message: "" }),
+    runTelegramTaskAttempt: async () => ({
+      text: "",
+      sessionId: null,
+      repairedIncompleteReply: false,
+    }),
+  };
+
+  await internal.handleIncomingMessage({
+    message_id: 9100,
+    date: Math.floor(Date.now() / 1000),
+    text: "/help@TestBot",
+    chat: { id: Number(chatId), type: "supergroup" },
+  } as TelegramMessage);
+
+  await internal.handleIncomingMessage({
+    message_id: 9101,
+    date: Math.floor(Date.now() / 1000),
+    text: "/stop@TestBot",
+    chat: { id: Number(chatId), type: "supergroup" },
+  } as TelegramMessage);
+
+  assert.match(sentTexts[0] || "", /\/stop/);
+  assert.equal(getTelegramTaskById(queuedTask.id)?.status, "cancelled");
+  assert.ok(deletedMessageIds.includes(8201));
+});
+
+test("TelegramChannel ignores bot-suffixed commands addressed to another bot", async () => {
+  const sentTexts: string[] = [];
+  const deletedMessageIds: number[] = [];
+  const chatId = `${Date.now()}`.slice(-9);
+  const channel = new TelegramChannel({
+    sendMessage: async (_botToken, tgChatId, text) => {
+      sentTexts.push(`${tgChatId}:${text}`);
+      return {
+        message_id: 7300 + sentTexts.length,
+        date: Math.floor(Date.now() / 1000),
+        text,
+        chat: { id: Number(tgChatId), type: "supergroup" },
+      } as TelegramMessage;
+    },
+    deleteMessage: async (_botToken, _tgChatId, messageId) => {
+      deletedMessageIds.push(messageId);
+      return true as never;
+    },
+  });
+
+  const queuedTask = createTask({
+    chatId,
+    status: "queued",
+    latestStatusMessageId: 8301,
+  });
+  createTelegramTask(queuedTask);
+
+  const internal = channel as unknown as {
+    config: {
+      botToken: string;
+      ownerChatId: string;
+      privateOnly: boolean;
+      allowGroups: boolean;
+      pollingTimeoutSeconds: number;
+      finalReplyMode: "replace";
+    } | null;
+    botUsername: string | null;
+    callbacks: object | null;
+    handleIncomingMessage: (message: TelegramMessage) => Promise<void>;
+  };
+
+  internal.config = {
+    botToken: "test-token",
+    ownerChatId: chatId,
+    privateOnly: false,
+    allowGroups: true,
+    pollingTimeoutSeconds: 30,
+    finalReplyMode: "replace",
+  };
+  internal.botUsername = "TestBot";
+  internal.callbacks = {
+    generateReply: async () => "",
+    resetSession: () => {},
+    listModels: () => [],
+    switchModel: () => ({ success: true, message: "" }),
+    getMemoryStatus: () => "",
+    listMemories: () => "",
+    remember: async () => ({ success: true, message: "" }),
+    updateProfile: async () => ({ success: true, message: "" }),
+    forgetMemory: async () => ({ success: true, message: "" }),
+    compressMemory: async () => ({ success: true, message: "" }),
+    runTelegramTaskAttempt: async () => ({
+      text: "",
+      sessionId: null,
+      repairedIncompleteReply: false,
+    }),
+  };
+
+  await internal.handleIncomingMessage({
+    message_id: 9200,
+    date: Math.floor(Date.now() / 1000),
+    text: "/help@OtherBot",
+    chat: { id: Number(chatId), type: "supergroup" },
+  } as TelegramMessage);
+
+  await internal.handleIncomingMessage({
+    message_id: 9201,
+    date: Math.floor(Date.now() / 1000),
+    text: "/stop@OtherBot",
+    chat: { id: Number(chatId), type: "supergroup" },
+  } as TelegramMessage);
+
+  assert.equal(sentTexts.length, 0);
+  assert.equal(getTelegramTaskById(queuedTask.id)?.status, "queued");
+  assert.deepEqual(deletedMessageIds, []);
 });

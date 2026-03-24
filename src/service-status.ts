@@ -3,6 +3,7 @@ export interface ServiceStatusPayload {
   app: "anybot";
   version: string;
   pid: number;
+  webHost?: string;
   webPort: number;
   provider: string;
   currentModel: string;

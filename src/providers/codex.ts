@@ -12,10 +12,12 @@ import type { CodexJsonEvent } from "../types.js";
 import { logger } from "../logger.js";
 import {
   DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+  DEFAULT_PROVIDER_LONG_STEP_STALL_TIMEOUT_MS,
   DEFAULT_PROVIDER_MAX_RUNTIME_MS,
   getProviderLongStepKey,
   isProviderProgressEvent,
   shouldTriggerProviderIdleTimeout,
+  shouldTriggerProviderLongStepStallTimeout,
   normalizeProviderRuntimeEvent,
 } from "./runtime.js";
 
@@ -25,7 +27,11 @@ export class ProviderTimeoutError extends Error {
   readonly hadProgress: boolean;
 
   constructor(kind: ProviderTimeoutKind, timeoutMs: number, hadProgress: boolean) {
-    const label = kind === "idle" ? "stalled with no progress" : "reached max runtime";
+    const label = kind === "idle"
+      ? "stalled with no progress"
+      : kind === "long_step_stalled"
+        ? "stalled during a long-running step"
+        : "reached max runtime";
     super(`Provider execution ${label} after ${Math.round(timeoutMs / 1000)}s`);
     this.name = "ProviderTimeoutError";
     this.kind = kind;
@@ -115,6 +121,7 @@ export class CodexProvider implements IProvider {
       sessionId,
       timeoutMs,
       idleTimeoutMs = DEFAULT_PROVIDER_IDLE_TIMEOUT_MS,
+      longStepStallTimeoutMs = DEFAULT_PROVIDER_LONG_STEP_STALL_TIMEOUT_MS,
       maxRuntimeMs = timeoutMs ?? DEFAULT_PROVIDER_MAX_RUNTIME_MS,
       signal,
       onEvent,
@@ -158,6 +165,7 @@ export class CodexProvider implements IProvider {
       imageCount: imagePaths.length,
       promptChars: prompt.length,
       idleTimeoutMs,
+      longStepStallTimeoutMs,
       maxRuntimeMs,
     });
 
@@ -176,9 +184,15 @@ export class CodexProvider implements IProvider {
       let closed = false;
       let startedThreadId: string | null = null;
       let lastMessage: string | null = null;
-      let timeoutState: { kind: ProviderTimeoutKind; timeoutMs: number; hadProgress: boolean } | null = null;
+      let timeoutState: {
+        kind: ProviderTimeoutKind;
+        timeoutMs: number;
+        hadProgress: boolean;
+        activeLongStepCount: number;
+      } | null = null;
       let sawProgress = false;
       let lastProgressAt = startedAt;
+      let lastRuntimeEventAt = startedAt;
       const activeLongStepKeys = new Set<string>();
       let idleTimer: NodeJS.Timeout | null = null;
       let maxRuntimeTimer: NodeJS.Timeout | null = null;
@@ -245,6 +259,7 @@ export class CodexProvider implements IProvider {
           kind,
           timeoutMs: limitMs,
           hadProgress: sawProgress,
+          activeLongStepCount: activeLongStepKeys.size,
         };
         if (idleTimer) {
           clearTimeout(idleTimer);
@@ -277,6 +292,11 @@ export class CodexProvider implements IProvider {
         }
       };
 
+      const markRuntimeEvent = () => {
+        lastRuntimeEventAt = Date.now();
+        resetIdleTimer();
+      };
+
       const markProgress = () => {
         sawProgress = true;
         lastProgressAt = Date.now();
@@ -289,6 +309,16 @@ export class CodexProvider implements IProvider {
 
       const checkIdleTimer = () => {
         const now = Date.now();
+        if (shouldTriggerProviderLongStepStallTimeout(
+          lastRuntimeEventAt,
+          activeLongStepKeys.size,
+          now,
+          longStepStallTimeoutMs,
+        )) {
+          triggerTimeout("long_step_stalled", longStepStallTimeoutMs);
+          return;
+        }
+
         if (shouldTriggerProviderIdleTimeout(
           lastProgressAt,
           activeLongStepKeys.size,
@@ -304,8 +334,9 @@ export class CodexProvider implements IProvider {
         }
 
         const elapsed = now - lastProgressAt;
+        const longStepElapsed = now - lastRuntimeEventAt;
         const nextDelay = activeLongStepKeys.size > 0
-          ? idleTimeoutMs
+          ? Math.max(1, longStepStallTimeoutMs - longStepElapsed)
           : Math.max(1, idleTimeoutMs - elapsed);
         scheduleIdleCheck(nextDelay);
       };
@@ -342,6 +373,7 @@ export class CodexProvider implements IProvider {
           }
 
           trackLongStep(normalizedEvent);
+          markRuntimeEvent();
           if (isProviderProgressEvent(normalizedEvent)) {
             markProgress();
           }
@@ -446,6 +478,9 @@ export class CodexProvider implements IProvider {
             workdir,
             sandbox,
             durationMs: Date.now() - startedAt,
+            activeLongStepCount: timeoutState.activeLongStepCount,
+            lastRuntimeEventAt,
+            lastProgressAt,
             timeoutKind: timeoutState.kind,
             timeoutMs: timeoutState.timeoutMs,
             hadProgress: timeoutState.hadProgress,

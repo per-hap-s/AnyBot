@@ -10,6 +10,7 @@ import {
   TELEGRAM_COMMAND_STATUS_TEXT,
   TELEGRAM_FILE_STATUS_TEXT,
   TELEGRAM_FINALIZING_STATUS_TEXT,
+  TELEGRAM_PLAN_STATUS_TEXT,
   TELEGRAM_REPAIRING_STATUS_TEXT,
   TELEGRAM_RUNNING_STATUS_TEXT,
   TELEGRAM_TOOL_STATUS_TEXT,
@@ -105,6 +106,41 @@ test("mapProviderEventToTelegramStatus exposes repair-in-progress events", () =>
   assert.deepEqual(repair, {
     phase: "processing",
     text: TELEGRAM_REPAIRING_STATUS_TEXT,
+  });
+});
+
+test("mapProviderEventToTelegramStatus renders compact chinese todo summaries", () => {
+  const todo = mapProviderEventToTelegramStatus({
+    type: "item.started",
+    itemType: "todo_list",
+    todoCompleted: 2,
+    todoTotal: 5,
+    todoCurrentStep: "summarize the Telegram chinese plan summary for the user-facing status",
+  });
+
+  assert.deepEqual(todo, {
+    phase: "processing",
+    text: "当前计划：2/5 已完成；当前步骤：正在整理结果：Telegram 中文计划摘要",
+  });
+});
+
+test("mapProviderEventToTelegramStatus falls back to the latest work context when todo step is missing", () => {
+  const todo = mapProviderEventToTelegramStatus(
+    {
+      type: "item.started",
+      itemType: "todo_list",
+      todoCompleted: 1,
+      todoTotal: 4,
+    },
+    {
+      itemType: "web_search",
+      query: "Telegram runtime status tracker behavior",
+    },
+  );
+
+  assert.deepEqual(todo, {
+    phase: "processing",
+    text: "当前计划：1/4 已完成；当前步骤：正在查资料：Telegram runtime status tracker...",
   });
 });
 
